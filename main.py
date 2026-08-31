@@ -14,7 +14,7 @@ from telegram.ext import (
 # =========================
 # SETTINGS
 # =========================
-BOT_TOKEN = "8989730014:AAGq4Ppq3YKlzukOSTkEr-BUZ_mrjn0RPWs"
+BOT_TOKEN = "BOT_TOKEN"
 CONTACT_USERNAME = "@berizienuhq"
 PRICE = "NA"
 
