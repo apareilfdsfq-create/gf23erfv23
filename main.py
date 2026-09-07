@@ -813,6 +813,9 @@ def is_admin(user):
 # ============================================================
 
 sessions = {}
+# Last customer/admin screen message per user. Kept outside sessions so
+# clearing a workflow never loses the message that must be deleted next.
+screen_messages = {}
 
 
 def session_for(user_id):
@@ -837,14 +840,14 @@ async def remember_screen(
     parse_mode="HTML",
     delete_previous=True,
 ):
-    session = session_for(user_id)
+    # IMPORTANT: the screen message must NOT live inside `sessions`.
+    # Workflows frequently call sessions.pop(...) when they finish, and
+    # doing that used to erase the ID of the previous bot message. The next
+    # /start therefore could not delete it, causing messages to pile up.
+    previous_message_id = screen_messages.get(user_id)
 
-    if delete_previous:
-        await safe_delete(
-            bot,
-            chat_id,
-            session.get("screen_message_id"),
-        )
+    if delete_previous and previous_message_id:
+        await safe_delete(bot, chat_id, previous_message_id)
 
     message = await bot.send_message(
         chat_id=chat_id,
@@ -853,7 +856,7 @@ async def remember_screen(
         reply_markup=reply_markup,
     )
 
-    session["screen_message_id"] = message.message_id
+    screen_messages[user_id] = message.message_id
     return message
 
 
@@ -864,32 +867,39 @@ async def edit_screen(
     reply_markup=None,
     parse_mode="HTML",
 ):
-    session = session_for(user_id)
+    bot = query.get_bot()
+    chat_id = query.message.chat_id
+
     try:
+        # Inline navigation edits ONE existing screen instead of creating a
+        # new message. This is the cleanest Telegram UX.
         await query.edit_message_text(
             text=text,
             parse_mode=parse_mode,
             reply_markup=reply_markup,
         )
-        session["screen_message_id"] = query.message.message_id
+        screen_messages[user_id] = query.message.message_id
     except BadRequest as error:
-        # Handles old/expired message IDs or unchanged-message errors.
+        # Telegram returns this when the requested content is identical.
         if "Message is not modified" in str(error):
-            session["screen_message_id"] = query.message.message_id
+            screen_messages[user_id] = query.message.message_id
             return
+
+        # If the old screen disappeared (manual deletion, message expiry,
+        # etc.), create exactly ONE replacement and remember its ID.
         try:
             await safe_delete(
-                query.get_bot(),
-                query.message.chat_id,
-                session.get("screen_message_id"),
+                bot,
+                chat_id,
+                screen_messages.get(user_id),
             )
-            message = await query.get_bot().send_message(
-                chat_id=query.message.chat_id,
+            message = await bot.send_message(
+                chat_id=chat_id,
                 text=text,
                 parse_mode=parse_mode,
                 reply_markup=reply_markup,
             )
-            session["screen_message_id"] = message.message_id
+            screen_messages[user_id] = message.message_id
         except TelegramError:
             raise
 
@@ -1134,9 +1144,8 @@ def back_to_admin():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    sessions.pop(user_id, None)
-
     await clear_user_message(update)
+    sessions.pop(user_id, None)
 
     # /start is sent by the user; remember that command message may have
     # failed deletion and ignore the failure.
@@ -1160,8 +1169,8 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    sessions.pop(update.effective_user.id, None)
     await clear_user_message(update)
+    sessions.pop(update.effective_user.id, None)
 
     await remember_screen(
         context.bot,
