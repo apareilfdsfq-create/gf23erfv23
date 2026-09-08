@@ -3,10 +3,16 @@ import html
 import sqlite3
 import logging
 import re
+import base64
+import hashlib
+import io
+import json
+import zlib
+from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, InputFile
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
@@ -26,7 +32,22 @@ BOOTSTRAP_ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
 
 # Railway: use a Volume mounted at /data for real persistence.
 # You can override this with DATABASE_FILE.
-DEFAULT_DB = "/data/srpexchange.db" if os.path.isdir("/data") else "srpexchange.db"
+# For compatibility, an existing older `shop.db` is preferred when the new
+# `srpexchange.db` does not exist, so upgrading the script does not reset data.
+if os.path.isdir("/data"):
+    if os.path.exists("/data/srpexchange.db"):
+        DEFAULT_DB = "/data/srpexchange.db"
+    elif os.path.exists("/data/shop.db"):
+        DEFAULT_DB = "/data/shop.db"
+    else:
+        DEFAULT_DB = "/data/srpexchange.db"
+else:
+    if os.path.exists("srpexchange.db"):
+        DEFAULT_DB = "srpexchange.db"
+    elif os.path.exists("shop.db"):
+        DEFAULT_DB = "shop.db"
+    else:
+        DEFAULT_DB = "srpexchange.db"
 DATABASE_FILE = os.getenv("DATABASE_FILE", DEFAULT_DB).strip()
 
 BOOTSTRAP_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "berizienuhq").strip().lstrip("@")
@@ -83,9 +104,24 @@ DEFAULT_SETTINGS = {
     "admin_username": "@berizienuhq",
     "order_recipient_chat_id": BOOTSTRAP_ADMIN_CHAT_ID,
     "max_custom_amount": "1000000",
-    "delete_user_messages": "1",
+    "delete_user_messages": "0",
     "show_admin_button": "1",
+    "maintenance_mode": "0",
+    "show_product_prices": "0",
+    "customer_order_history": "0",
+    "anti_spam": "0",
+    "anti_spam_seconds": "2",
+    "debug_mode": "0",
 }
+
+# ============================================================================
+# EMBEDDED BACKUP
+# ============================================================================
+# The admin panel can generate a copy of this script with the current database
+# embedded here. A fresh database restores this data automatically.
+EMBEDDED_BACKUP = r""""""
+BACKUP_PREFIX = "SRPEXCHANGE_BACKUP_V1:"
+BACKUP_FORMAT_VERSION = 1
 
 DEFAULT_TEXTS = {
     "welcome": (
@@ -142,6 +178,14 @@ DEFAULT_TEXTS = {
         "Something went wrong while creating your order. Please try again."
     ),
     "no_session": "Please open the shop again with /start.",
+    "maintenance": (
+        "🛠️ <b>SHOP TEMPORARILY CLOSED</b>\n\n"
+        "The shop is currently under maintenance. Please check back soon."
+    ),
+    "history": (
+        "📋 <b>YOUR ORDERS</b>\n\n"
+        "Here are your most recent orders."
+    ),
     "admin_new_order": (
         "🔔 <b>NEW ORDER</b>\n\n"
         "🔐 Order: <code>{order_number}</code>\n"
@@ -173,6 +217,7 @@ DEFAULT_BUTTONS = {
     "new_order": "💱 New Order",
     "cancel": "❌ Cancel",
     "custom": "✏️ Custom Amount",
+    "history": "📋 My Orders",
     "admin": "⚙️ Admin Panel",
     "categories": "🗂️ Categories",
     "currencies": "💱 Currencies",
@@ -208,6 +253,8 @@ TEXT_LABELS = {
     "invalid_username": "⚠️ Invalid username",
     "order_error": "⚠️ Order creation error",
     "no_session": "🔄 No active session",
+    "maintenance": "🛠️ Maintenance Message",
+    "history": "📋 Customer Order History",
     "admin_new_order": "🔔 Admin new-order message",
     "admin_send_failed": "⚠️ Admin notification failure",
 }
@@ -335,6 +382,15 @@ def init_db():
             "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
             (key, value),
         )
+
+    # v3 used cleanup ON by default. Disable it once during the upgrade so
+    # existing installations immediately stop deleting user messages.
+    cleanup_migrated = cur.execute(
+        "SELECT value FROM settings WHERE key='v4_cleanup_migrated'"
+    ).fetchone()
+    if not cleanup_migrated:
+        cur.execute("UPDATE settings SET value='0' WHERE key='delete_user_messages'")
+        cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('v4_cleanup_migrated','1')")
 
     # Preserve old shop name only if it was an old generic value.
     old_name = cur.execute(
@@ -698,6 +754,158 @@ def remove_admin(telegram_id):
 
 
 # ============================================================
+# PORTABLE BACKUP / RESTORE
+# ============================================================
+
+BACKUP_TABLES = (
+    "settings", "categories", "currencies", "products", "prices",
+    "custom_prices", "texts", "buttons", "custom_emojis", "orders", "admins",
+)
+
+
+def _table_rows(conn, table):
+    return [dict(row) for row in conn.execute(f"SELECT * FROM {table}").fetchall()]
+
+
+def make_backup_payload():
+    conn = db()
+    tables = {table: _table_rows(conn, table) for table in BACKUP_TABLES}
+    conn.close()
+    return {"format": BACKUP_FORMAT_VERSION, "exported_at": now_string(), "tables": tables}
+
+
+def encode_backup(payload=None):
+    payload = payload or make_backup_payload()
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    envelope = {
+        "format": BACKUP_FORMAT_VERSION,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "data": base64.b64encode(zlib.compress(raw, 9)).decode("ascii"),
+    }
+    return BACKUP_PREFIX + json.dumps(envelope, separators=(",", ":"))
+
+
+def decode_backup(blob):
+    blob = (blob or "").strip()
+    if not blob:
+        raise ValueError("Backup is empty.")
+    if not blob.startswith(BACKUP_PREFIX):
+        try:
+            payload = json.loads(blob)
+            if "tables" in payload:
+                return payload
+        except Exception:
+            pass
+        raise ValueError("This is not a valid SRPExchange backup.")
+    envelope = json.loads(blob[len(BACKUP_PREFIX):])
+    if envelope.get("format") != BACKUP_FORMAT_VERSION:
+        raise ValueError("Unsupported backup version.")
+    raw = zlib.decompress(base64.b64decode(envelope["data"]))
+    if hashlib.sha256(raw).hexdigest() != envelope.get("sha256"):
+        raise ValueError("Backup checksum failed.")
+    payload = json.loads(raw.decode("utf-8"))
+    if "tables" not in payload:
+        raise ValueError("Backup contains no database data.")
+    return payload
+
+
+def backup_summary(payload=None):
+    tables = (payload or make_backup_payload()).get("tables", {})
+    return (
+        f"🗂️ Categories: {len(tables.get('categories', []))}\n"
+        f"📦 Products: {len(tables.get('products', []))}\n"
+        f"💱 Currencies: {len(tables.get('currencies', []))}\n"
+        f"✨ Custom emojis: {len(tables.get('custom_emojis', []))}\n"
+        f"📋 Orders: {len(tables.get('orders', []))}\n"
+        f"👮 Admins: {len(tables.get('admins', []))}"
+    )
+
+
+def restore_backup(blob):
+    payload = decode_backup(blob)
+    tables = payload.get("tables", {})
+    conn = db()
+    try:
+        # Backups may contain nested categories whose parents are restored later.
+        # Disable FK checks for this atomic replacement, then re-enable them.
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN")
+        for table in ("prices", "custom_prices", "orders", "products", "categories", "currencies", "custom_emojis", "texts", "buttons", "admins", "settings"):
+            conn.execute(f"DELETE FROM {table}")
+        for table in ("settings", "categories", "currencies", "products", "custom_emojis", "texts", "buttons", "orders", "admins", "prices", "custom_prices"):
+            for row in tables.get(table, []):
+                if not row:
+                    continue
+                columns = list(row.keys())
+                marks = ",".join("?" for _ in columns)
+                conn.execute(
+                    f"INSERT INTO {table} ({','.join(columns)}) VALUES ({marks})",
+                    [row[c] for c in columns],
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+        except Exception:
+            pass
+        conn.close()
+    if BOOTSTRAP_ADMIN_CHAT_ID:
+        try:
+            add_admin(int(BOOTSTRAP_ADMIN_CHAT_ID), "Bootstrap admin")
+        except ValueError:
+            pass
+    return payload
+
+
+def load_embedded_backup_if_fresh(fresh_db):
+    blob = EMBEDDED_BACKUP.strip()
+    if not fresh_db or not blob:
+        return False
+    try:
+        payload = restore_backup(blob)
+        logger.info("Embedded backup restored: %s", backup_summary(payload).replace("\n", " | "))
+        return True
+    except Exception:
+        logger.exception("Embedded backup could not be restored")
+        return False
+
+
+def embed_backup_in_source(source_text, backup_blob):
+    pattern = re.compile(
+        r'(?s)(# ============================================================================\n# EMBEDDED BACKUP\n# ============================================================================\n.*?EMBEDDED_BACKUP = r""").*?("""\nBACKUP_PREFIX =)'
+    )
+    updated, count = pattern.subn(lambda m: m.group(1) + backup_blob + m.group(2), source_text, count=1)
+    if count != 1:
+        raise RuntimeError("Embedded backup section was not found.")
+    return updated
+
+
+def build_script_with_current_backup():
+    source = Path(__file__).resolve().read_text(encoding="utf-8")
+    return embed_backup_in_source(source, encode_backup())
+
+
+async def send_backup_file(bot, chat_id):
+    stream = io.BytesIO(encode_backup().encode("utf-8"))
+    stream.name = "srpexchange_backup.txt"
+    await bot.send_document(chat_id=chat_id, document=InputFile(stream, filename="srpexchange_backup.txt"), caption="💾 Current SRPExchange backup.")
+
+
+async def send_embedded_script(bot, chat_id):
+    stream = io.BytesIO(build_script_with_current_backup().encode("utf-8"))
+    stream.name = "main_with_backup.py"
+    await bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(stream, filename="main_with_backup.py"),
+        caption="📦 <b>UPDATED SCRIPT WITH BACKUP</b>\n\nYour current data is embedded in EMBEDDED_BACKUP.",
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
 # CUSTOM EMOJI HELPERS
 # ============================================================
 
@@ -824,11 +1032,14 @@ def render_text(key, **values):
         # Most dynamic values appear inside HTML. Keep markup safe.
         data[k] = esc(v) if isinstance(v, str) else v
     template = get_text(key, "")
+    # Resolve custom emoji tokens before str.format(), otherwise {{emoji:name}}
+    # becomes {emoji:name} before the custom-emoji parser sees it.
+    template = replace_emoji_tokens(template)
     try:
         rendered = template.format(**data)
     except Exception:
         rendered = template
-    return replace_emoji_tokens(rendered)
+    return rendered
 
 
 def text_label(key):
@@ -961,7 +1172,7 @@ async def edit_screen(query, text, reply_markup=None):
 async def cleanup_user_message(update):
     if not update.message:
         return
-    if get_setting("delete_user_messages", "1") != "1":
+    if get_setting("delete_user_messages", "0") != "1":
         return
     await safe_delete(update.get_bot(), update.effective_chat.id, update.message.message_id)
 
@@ -976,6 +1187,8 @@ def main_keyboard(user):
         [InlineKeyboardButton(get_button("exchange", "💱 Exchange"), callback_data="exchange")],
         [InlineKeyboardButton(get_button("how", "ℹ️ How It Works"), callback_data="how")],
     ]
+    if get_setting("customer_order_history", "0") == "1":
+        rows.append([InlineKeyboardButton(get_button("history", "📋 My Orders"), callback_data="history")])
     if is_admin(user) and get_setting("show_admin_button", "1") == "1":
         rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
     return kb(rows)
@@ -1003,23 +1216,18 @@ def currency_keyboard(category_id):
 
 def product_keyboard(category_id, currency_id):
     products = get_products(category_id, True)
-    buttons = [
-        InlineKeyboardButton(p["button_text"], callback_data=f"prod:{currency_id}:{p['id']}")
-        for p in products
-        if not p["is_custom"]
-    ]
+    show_prices = get_setting("show_product_prices", "0") == "1"
     rows = []
     row = []
-    for button in buttons:
-        row.append(button)
+    for p in products:
+        label = p["button_text"]
+        if show_prices:
+            label = f"{label} · {get_custom_price(currency_id) if p['is_custom'] else get_price(currency_id, p['id'])}"
+        row.append(InlineKeyboardButton(label, callback_data=f"prod:{currency_id}:{p['id']}"))
         if len(row) == 2:
-            rows.append(row)
-            row = []
+            rows.append(row); row=[]
     if row:
         rows.append(row)
-    custom_products = [p for p in products if p["is_custom"]]
-    for p in custom_products:
-        rows.append([InlineKeyboardButton(p["button_text"], callback_data=f"prod:{currency_id}:{p['id']}")])
     rows.append([back_button(f"curback:{category_id}")])
     return kb(rows)
 
@@ -1041,6 +1249,9 @@ async def show_home_query(query):
 
 
 async def show_exchange(query):
+    if get_setting("maintenance_mode", "0") == "1" and not is_admin(query.from_user):
+        await edit_screen(query, render_text("maintenance"), kb([[back_button("home")]]))
+        return
     categories = get_categories(None, True)
     if not categories:
         await edit_screen(query, render_text("no_categories"), kb([[back_button("home")]]))
@@ -1118,15 +1329,14 @@ async def show_how(query):
 
 def admin_keyboard():
     return kb([
+        [InlineKeyboardButton("📊 Dashboard", callback_data="a:dashboard"), InlineKeyboardButton("🔄 Refresh", callback_data="admin")],
         [InlineKeyboardButton(get_button("categories", "🗂️ Categories"), callback_data="a:cats")],
         [InlineKeyboardButton(get_button("products", "📦 Products"), callback_data="a:products")],
-        [InlineKeyboardButton(get_button("currencies", "💱 Currencies"), callback_data="a:currencies"),
-         InlineKeyboardButton(get_button("prices", "💰 Prices"), callback_data="a:prices")],
-        [InlineKeyboardButton(get_button("texts", "📝 Texts"), callback_data="a:texts"),
-         InlineKeyboardButton(get_button("buttons", "🔘 Buttons"), callback_data="a:buttons")],
+        [InlineKeyboardButton(get_button("currencies", "💱 Currencies"), callback_data="a:currencies"), InlineKeyboardButton(get_button("prices", "💰 Prices"), callback_data="a:prices")],
+        [InlineKeyboardButton(get_button("texts", "📝 Texts"), callback_data="a:texts"), InlineKeyboardButton(get_button("buttons", "🔘 Buttons"), callback_data="a:buttons")],
         [InlineKeyboardButton(get_button("emojis", "✨ Custom Emojis"), callback_data="a:emojis")],
-        [InlineKeyboardButton(get_button("settings", "🏪 Shop Settings"), callback_data="a:settings"),
-         InlineKeyboardButton(get_button("admins", "👮 Admins"), callback_data="a:admins")],
+        [InlineKeyboardButton("💾 Backup & Restore", callback_data="a:backup"), InlineKeyboardButton("🧰 Miscellaneous", callback_data="a:misc")],
+        [InlineKeyboardButton(get_button("settings", "🏪 Shop Settings"), callback_data="a:settings"), InlineKeyboardButton(get_button("admins", "👮 Admins"), callback_data="a:admins")],
         [InlineKeyboardButton(get_button("orders", "📋 Orders"), callback_data="a:orders")],
         [InlineKeyboardButton(get_button("home", "🏠 Main Menu"), callback_data="home")],
     ])
@@ -1188,6 +1398,7 @@ def product_edit_keyboard(product_id):
          InlineKeyboardButton("💰 Prices", callback_data=f"p_prices:{product_id}")],
         [InlineKeyboardButton("📝 Description", callback_data=f"p_desc:{product_id}"),
          InlineKeyboardButton("📂 Move", callback_data=f"p_move:{product_id}")],
+        [InlineKeyboardButton("📋 Duplicate", callback_data=f"p_duplicate:{product_id}")],
         [InlineKeyboardButton("🟢 / 🔴 Enable", callback_data=f"ptoggle:{product_id}"),
          InlineKeyboardButton("🗑️ Delete", callback_data=f"pdelete:{product_id}")],
         [InlineKeyboardButton("↕️ Reorder", callback_data=f"p_order:{product_id}")],
@@ -1248,7 +1459,7 @@ def settings_keyboard():
         [InlineKeyboardButton("🆔 Order Recipient Chat ID", callback_data="set:recipient")],
         [InlineKeyboardButton("🔢 Max Custom Amount", callback_data="set:max_amount")],
         [InlineKeyboardButton(
-            f"🧹 User message cleanup: {'ON' if get_setting('delete_user_messages','1')=='1' else 'OFF'}",
+            f"🧹 User message cleanup: {'ON' if get_setting('delete_user_messages','0')=='1' else 'OFF'}",
             callback_data="toggle:cleanup",
         )],
         [InlineKeyboardButton(
@@ -1439,7 +1650,7 @@ async def show_settings(query):
         f"👤 Support username: <b>{esc(get_setting('admin_username'))}</b>\n"
         f"🆔 Order recipient: <code>{esc(recipient)}</code>\n"
         f"🔢 Max custom amount: <b>{esc(get_setting('max_custom_amount'))}</b>\n"
-        f"🧹 Delete user messages: <b>{'ON' if get_setting('delete_user_messages','1')=='1' else 'OFF'}</b>\n"
+        f"🧹 Delete user messages: <b>{'ON' if get_setting('delete_user_messages','0')=='1' else 'OFF'}</b>\n"
         f"⚙️ Admin button in shop: <b>{'ON' if get_setting('show_admin_button','1')=='1' else 'OFF'}</b>",
         settings_keyboard(),
     )
@@ -1475,6 +1686,87 @@ async def show_emoji_edit(query, emoji_id):
         f"Token: <code>{{{{emoji:{esc(e['name'])}}}}}</code>",
         emoji_edit_keyboard(emoji_id),
     )
+
+
+async def show_dashboard(query):
+    conn = db()
+    stats = {
+        "categories": conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0],
+        "products": conn.execute("SELECT COUNT(*) FROM products").fetchone()[0],
+        "currencies": conn.execute("SELECT COUNT(*) FROM currencies").fetchone()[0],
+        "orders": conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
+        "pending": conn.execute("SELECT COUNT(*) FROM orders WHERE status='awaiting_confirmation'").fetchone()[0],
+        "confirmed": conn.execute("SELECT COUNT(*) FROM orders WHERE status='confirmed'").fetchone()[0],
+        "rejected": conn.execute("SELECT COUNT(*) FROM orders WHERE status='rejected'").fetchone()[0],
+        "emojis": conn.execute("SELECT COUNT(*) FROM custom_emojis").fetchone()[0],
+    }
+    conn.close()
+    await edit_screen(query, "📊 <b>DASHBOARD</b>\n\n"
+        f"🗂️ Categories: <b>{stats['categories']}</b>\n"
+        f"📦 Products: <b>{stats['products']}</b>\n"
+        f"💱 Currencies: <b>{stats['currencies']}</b>\n"
+        f"✨ Custom emojis: <b>{stats['emojis']}</b>\n\n"
+        f"📋 Orders: <b>{stats['orders']}</b>\n"
+        f"⏳ Pending: <b>{stats['pending']}</b>\n"
+        f"✅ Confirmed: <b>{stats['confirmed']}</b>\n"
+        f"❌ Rejected: <b>{stats['rejected']}</b>\n\n"
+        f"💾 Embedded backup: <b>{'available' if EMBEDDED_BACKUP.strip() else 'not set'}</b>",
+        kb([[InlineKeyboardButton("💾 Backup & Restore", callback_data="a:backup")], [InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]))
+
+
+def misc_keyboard():
+    def state(key): return "ON" if get_setting(key, "0") == "1" else "OFF"
+    return kb([
+        [InlineKeyboardButton(f"🛠️ Maintenance Mode: {state('maintenance_mode')}", callback_data="misc:maintenance")],
+        [InlineKeyboardButton(f"💰 Show Prices on Product Buttons: {state('show_product_prices')}", callback_data="misc:show_prices")],
+        [InlineKeyboardButton(f"📋 Customer Order History: {state('customer_order_history')}", callback_data="misc:history")],
+        [InlineKeyboardButton(f"🛡️ Anti-Spam Protection: {state('anti_spam')}", callback_data="misc:anti_spam")],
+        [InlineKeyboardButton(f"⏱️ Anti-Spam Delay: {get_setting('anti_spam_seconds','2')}s", callback_data="misc:set_delay")],
+        [InlineKeyboardButton(f"🐞 Debug Logging: {state('debug_mode')}", callback_data="misc:debug")],
+        [InlineKeyboardButton("↩️ Admin Panel", callback_data="admin")],
+    ])
+
+
+async def show_misc(query):
+    await edit_screen(query, "🧰 <b>MISCELLANEOUS</b>\n\n"
+        "Every optional feature here starts <b>OFF</b>.\n\n"
+        "🛠️ Maintenance temporarily blocks customer exchanges.\n"
+        "💰 Price previews show prices on product buttons.\n"
+        "📋 Order history adds a customer-only history button.\n"
+        "🛡️ Anti-spam adds a callback cooldown.\n"
+        "🐞 Debug logging increases local logs for troubleshooting.", misc_keyboard())
+
+
+async def show_backup(query):
+    await edit_screen(query, "💾 <b>BACKUP & RESTORE</b>\n\n" + backup_summary() + "\n\n"
+        "📥 Import a previous backup (file or pasted string).\n"
+        "📤 Download the current portable backup.\n"
+        "📦 Download a fresh Python script with the current backup embedded.\n\n"
+        "A brand-new database automatically restores EMBEDDED_BACKUP.", kb([
+            [InlineKeyboardButton("📥 Import Backup", callback_data="backup:import")],
+            [InlineKeyboardButton("📤 Download Current Backup", callback_data="backup:download")],
+            [InlineKeyboardButton("📦 Download Updated Script", callback_data="backup:script")],
+            [InlineKeyboardButton("🔍 Backup Summary", callback_data="backup:summary")],
+            [InlineKeyboardButton("↩️ Admin Panel", callback_data="admin")],
+        ]))
+
+
+async def show_history(query):
+    if get_setting("customer_order_history", "0") != "1" and not is_admin(query.from_user):
+        await query.answer("Order history is disabled.", show_alert=True)
+        return
+    conn = db()
+    rows = conn.execute("SELECT * FROM orders WHERE telegram_id=? ORDER BY id DESC LIMIT 10", (query.from_user.id,)).fetchall()
+    conn.close()
+    if not rows:
+        body = "📋 <b>YOUR ORDERS</b>\n\nNo orders yet."
+    else:
+        lines = [render_text("history"), ""]
+        for o in rows:
+            icon = "⏳" if o["status"] == "awaiting_confirmation" else "✅" if o["status"] == "confirmed" else "❌"
+            lines.append(f"{icon} <b>{esc(o['order_number'])}</b> · {o['robux_amount']:,} Robux · {esc(o['currency'])}\n   👤 {esc(o['roblox_username'])} · {esc(o['created_at'])}")
+        body = "\n".join(lines)
+    await edit_screen(query, body, kb([[back_button("home")]]))
 
 
 async def show_admins(query):
@@ -1553,7 +1845,6 @@ def create_order(user, session, roblox_username):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     sessions.pop(user_id, None)
-    await cleanup_user_message(update)
     await send_or_edit_screen(
         update.get_bot(),
         update.effective_chat.id,
@@ -1565,7 +1856,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user):
-        await cleanup_user_message(update)
         await send_or_edit_screen(
             update.get_bot(), update.effective_chat.id, update.effective_user.id,
             "⛔ <b>ACCESS DENIED</b>",
@@ -1573,7 +1863,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     sessions.pop(update.effective_user.id, None)
-    await cleanup_user_message(update)
     await send_or_edit_screen(
         update.get_bot(), update.effective_chat.id, update.effective_user.id,
         "⚙️ <b>ADMIN PANEL</b>\n\nEverything is managed directly from Telegram.",
@@ -1593,6 +1882,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     user_id = user.id
 
+    # Optional callback cooldown. OFF by default.
+    if get_setting("anti_spam", "0") == "1":
+        now_ts = datetime.now().timestamp()
+        last_ts = screen_messages.get(f"anti:{user_id}", 0)
+        try:
+            cooldown = max(0.5, float(get_setting("anti_spam_seconds", "2")))
+        except (TypeError, ValueError):
+            cooldown = 2.0
+        if now_ts - last_ts < cooldown:
+            await query.answer("Please wait a moment.")
+            return
+        screen_messages[f"anti:{user_id}"] = now_ts
+
     # Customer navigation.
     if data == "noop":
         return
@@ -1605,6 +1907,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "how":
         await show_how(query)
+        return
+    if data == "history":
+        await show_history(query)
         return
     if data.startswith("cat:"):
         await show_category(query, int(data.split(":",1)[1]))
@@ -1653,7 +1958,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         session["currency_id"] = currency_id
         session["product_id"] = product_id
-        session["price"] = get_price(currency_id, product_id)
+        session["price"] = get_custom_price(currency_id) if product["is_custom"] else get_price(currency_id, product_id)
         if product["is_custom"]:
             session["waiting"] = "custom_amount"
             await edit_screen(query, render_text("custom"), cancel_keyboard())
@@ -1668,7 +1973,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "admin", "a:", "acat", "cedit", "cdelete", "ctoggle", "p_", "ptoggle", "pdelete",
         "apickcat", "curadd", "cedit:", "c_name", "c_button", "ctogglecur", "cdeletecur", "corder",
         "pricecur", "setprice", "setcustomprice", "text:", "button:", "set:", "toggle:", "emoji", "order:",
-        "orderstatus:", "adminadd", "adminremove", "acats", "category", "move_")
+        "orderstatus:", "adminadd", "adminremove", "acats", "category", "move_", "backup:", "misc:")
     if data.startswith(admin_prefixes) and not is_admin(user):
         await query.answer("⛔ Access denied.", show_alert=True)
         return
@@ -1677,6 +1982,57 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sessions.pop(user_id, None)
         await show_admin(query)
         return
+
+    # ---- Dashboard / Misc / Backup ----
+    if data == "a:dashboard":
+        await show_dashboard(query); return
+    if data == "a:misc":
+        await show_misc(query); return
+    if data == "misc:set_delay":
+        await ask_input(query, "setting:anti_spam_seconds", "⏱️ <b>ANTI-SPAM DELAY</b>\n\nSend a number between <code>0.5</code> and <code>30</code> seconds."); return
+    if data.startswith("misc:"):
+        key = {
+            "maintenance": "maintenance_mode",
+            "show_prices": "show_product_prices",
+            "history": "customer_order_history",
+            "anti_spam": "anti_spam",
+            "debug": "debug_mode",
+        }.get(data.split(":",1)[1])
+        if not key:
+            await query.answer("Unknown feature.", show_alert=True); return
+        set_setting(key, "0" if get_setting(key, "0") == "1" else "1")
+        logger.setLevel(logging.DEBUG if get_setting("debug_mode", "0") == "1" else logging.INFO)
+        await show_misc(query); return
+    if data == "a:backup":
+        await show_backup(query); return
+    if data == "backup:summary":
+        await edit_screen(query, "🔍 <b>BACKUP SUMMARY</b>\n\n" + backup_summary(), kb([[InlineKeyboardButton("💾 Backup & Restore", callback_data="a:backup")]])); return
+    if data == "backup:download":
+        await send_backup_file(context.bot, query.message.chat_id); return
+    if data == "backup:script":
+        try:
+            await send_embedded_script(context.bot, query.message.chat_id)
+            await query.answer("Updated script sent.")
+        except Exception as error:
+            logger.exception("Could not build updated script")
+            await query.answer("Could not build the script.", show_alert=True)
+        return
+    if data == "backup:import":
+        await ask_input(query, "backup_import", "📥 <b>IMPORT BACKUP</b>\n\nUpload your <code>srpexchange_backup.txt</code> file, or paste the backup string here.\n\nNothing is replaced until you confirm the restore.\n\n/cancel to abort."); return
+    if data == "backup:confirm":
+        blob = sessions.get(user_id, {}).get("backup_blob")
+        if not blob:
+            await query.answer("No backup is waiting.", show_alert=True); return
+        try:
+            payload = restore_backup(blob)
+            sessions.pop(user_id, None)
+            await edit_screen(query, "✅ <b>BACKUP RESTORED</b>\n\n" + backup_summary(payload), kb([[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]))
+        except Exception:
+            logger.exception("Backup restore failed")
+            await query.answer("Restore failed. Current data was left unchanged.", show_alert=True)
+        return
+    if data == "backup:cancel":
+        sessions.pop(user_id, None); await show_backup(query); return
 
     # ---- Categories ----
     if data == "a:cats":
@@ -1759,6 +2115,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("a_product:"):
         await show_product_edit(query, int(data.split(":",1)[1]))
         return
+    if data.startswith("p_duplicate:"):
+        source_id = int(data.split(":",1)[1])
+        source = get_product(source_id)
+        if not source:
+            await query.answer("Product not found.", show_alert=True); return
+        conn = db()
+        sort_order = conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM products WHERE category_id=?", (source["category_id"],)).fetchone()["n"]
+        cur = conn.execute("INSERT INTO products(name,button_text,amount,enabled,sort_order,category_id,description,is_custom) VALUES (?,?,?,?,?,?,?,?)", (f"{source['name']} Copy", source["button_text"], source["amount"], source["enabled"], sort_order, source["category_id"], source["description"], source["is_custom"]))
+        new_id = cur.lastrowid
+        for c in conn.execute("SELECT id FROM currencies").fetchall():
+            row = conn.execute("SELECT price FROM prices WHERE currency_id=? AND product_id=?", (c["id"], source_id)).fetchone()
+            conn.execute("INSERT OR REPLACE INTO prices(currency_id,product_id,price) VALUES (?,?,?)", (c["id"],new_id,row["price"] if row else "NA"))
+        conn.commit(); conn.close()
+        await show_product_edit(query, new_id); return
     if data.startswith("p_name:"):
         await ask_input(query, "product_name", "🔤 <b>PRODUCT NAME</b>\n\nSend the new product name.", product_id=int(data.split(":",1)[1]))
         return
@@ -1863,7 +2233,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "a:settings":
         await show_settings(query); return
     if data == "toggle:cleanup":
-        set_setting("delete_user_messages", "0" if get_setting("delete_user_messages","1") == "1" else "1")
+        set_setting("delete_user_messages", "0" if get_setting("delete_user_messages","0") == "1" else "1")
         await show_settings(query); return
     if data == "toggle:admin_button":
         set_setting("show_admin_button", "0" if get_setting("show_admin_button","1") == "1" else "1")
@@ -1968,6 +2338,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_input(query, "currency_order", "↕️ <b>CURRENCY ORDER</b>\n\nSend a whole-number sort position. Lower numbers appear first.", currency_id=int(data.split(":",1)[1])); return
 
 
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or not message.document:
+        return
+    user = update.effective_user
+    session = sessions.get(user.id)
+    if not is_admin(user) or not session or session.get("action") != "backup_import":
+        return
+    try:
+        tg_file = await context.bot.get_file(message.document.file_id)
+        blob = bytes(await tg_file.download_as_bytearray()).decode("utf-8")
+        payload = decode_backup(blob)
+        session["backup_blob"] = blob.strip()
+        session["action"] = "backup_confirm"
+        await send_or_edit_screen(context.bot, update.effective_chat.id, user.id,
+            "⚠️ <b>CONFIRM BACKUP RESTORE</b>\n\n" + backup_summary(payload) + "\n\n"
+            "This will replace the current shop data. Your bootstrap admin is restored afterward.",
+            kb([[InlineKeyboardButton("✅ Restore Backup", callback_data="backup:confirm")], [InlineKeyboardButton("❌ Cancel", callback_data="backup:cancel")]]))
+    except Exception as error:
+        await send_or_edit_screen(context.bot, update.effective_chat.id, user.id, f"⚠️ <b>INVALID BACKUP</b>\n\n{esc(error)}", cancel_keyboard())
+
+
 # ============================================================
 # TEXT MESSAGE HANDLER
 # ============================================================
@@ -2028,6 +2420,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Token: <code>{{{{emoji:{esc(name)}}}}}</code>",
             kb([[InlineKeyboardButton("✨ Emojis", callback_data="a:emojis")],[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]),
         )
+        return
+
+    # --------------------------------------------------------
+    # BACKUP IMPORT VIA PASTED STRING
+    # --------------------------------------------------------
+    if is_admin(user) and session and session.get("action") == "backup_import":
+        await cleanup_user_message(update)
+        try:
+            raw_backup = (message.text or "").strip()
+            payload = decode_backup(raw_backup)
+            session["backup_blob"] = raw_backup
+            session["action"] = "backup_confirm"
+            await send_or_edit_screen(context.bot, update.effective_chat.id, user_id,
+                "⚠️ <b>CONFIRM BACKUP RESTORE</b>\n\n" + backup_summary(payload) + "\n\n"
+                "This will replace the current shop data.",
+                kb([[InlineKeyboardButton("✅ Restore Backup", callback_data="backup:confirm")], [InlineKeyboardButton("❌ Cancel", callback_data="backup:cancel")]]))
+        except Exception as error:
+            await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, f"⚠️ <b>INVALID BACKUP</b>\n\n{esc(error)}", cancel_keyboard())
         return
 
     # --------------------------------------------------------
@@ -2198,6 +2608,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     n=int(value)
                     if n<=0: raise ValueError("Maximum must be positive.")
                     set_setting("max_custom_amount", n)
+                elif setting == "anti_spam_seconds":
+                    n=float(value)
+                    if n < 0.5 or n > 30: raise ValueError("Use a delay between 0.5 and 30 seconds.")
+                    set_setting("anti_spam_seconds", f"{n:g}")
                 else: raise ValueError("Unknown setting.")
                 sessions.pop(user_id,None); await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Setting updated.", settings_keyboard()); return
 
@@ -2341,15 +2755,19 @@ def validate_config():
 
 def main():
     validate_config()
+    fresh_db = not os.path.exists(DATABASE_FILE)
     init_db()
+    load_embedded_backup_if_fresh(fresh_db)
+    logger.setLevel(logging.DEBUG if get_setting("debug_mode", "0") == "1" else logging.INFO)
     logger.info("Database: %s", DATABASE_FILE)
-    logger.info("SRPExchange v3 starting...")
+    logger.info("SRPExchange v4 starting...")
 
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("cancel", text_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
+    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     application.add_error_handler(error_handler)
     application.run_polling(drop_pending_updates=True)
