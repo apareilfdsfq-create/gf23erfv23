@@ -104,7 +104,7 @@ DEFAULT_SETTINGS = {
     "admin_username": "@berizienuhq",
     "order_recipient_chat_id": BOOTSTRAP_ADMIN_CHAT_ID,
     "max_custom_amount": "1000000",
-    "delete_user_messages": "0",
+    "delete_user_messages": "1",
     "show_admin_button": "1",
     "maintenance_mode": "0",
     "show_product_prices": "0",
@@ -228,6 +228,7 @@ DEFAULT_BUTTONS = {
     "settings": "🏪 Shop Settings",
     "emojis": "✨ Custom Emojis",
     "orders": "📋 Orders",
+    "users": "👥 Users",
     "admins": "👮 Admins",
     "add": "➕ Add",
     "edit": "✏️ Edit",
@@ -354,6 +355,30 @@ def init_db():
             created_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id INTEGER PRIMARY KEY,
+            chat_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT NOT NULL DEFAULT '',
+            last_name TEXT NOT NULL DEFAULT '',
+            language_code TEXT,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            panel_message_id INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS tracked_messages (
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            telegram_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(chat_id, message_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tracked_messages_user
+            ON tracked_messages(telegram_id, deleted);
+
         CREATE TABLE IF NOT EXISTS admins (
             telegram_id INTEGER PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
@@ -383,14 +408,14 @@ def init_db():
             (key, value),
         )
 
-    # v3 used cleanup ON by default. Disable it once during the upgrade so
-    # existing installations immediately stop deleting user messages.
+    # v4 temporarily disabled message cleanup. On this requested upgrade,
+    # turn it back on once; afterwards the admin toggle is respected normally.
     cleanup_migrated = cur.execute(
-        "SELECT value FROM settings WHERE key='v4_cleanup_migrated'"
+        "SELECT value FROM settings WHERE key='v5_cleanup_migrated'"
     ).fetchone()
     if not cleanup_migrated:
-        cur.execute("UPDATE settings SET value='0' WHERE key='delete_user_messages'")
-        cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('v4_cleanup_migrated','1')")
+        cur.execute("UPDATE settings SET value='1' WHERE key='delete_user_messages'")
+        cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('v5_cleanup_migrated','1')")
 
     # Preserve old shop name only if it was an old generic value.
     old_name = cur.execute(
@@ -759,7 +784,7 @@ def remove_admin(telegram_id):
 
 BACKUP_TABLES = (
     "settings", "categories", "currencies", "products", "prices",
-    "custom_prices", "texts", "buttons", "custom_emojis", "orders", "admins",
+    "custom_prices", "texts", "buttons", "custom_emojis", "orders", "users", "admins",
 )
 
 
@@ -817,6 +842,7 @@ def backup_summary(payload=None):
         f"💱 Currencies: {len(tables.get('currencies', []))}\n"
         f"✨ Custom emojis: {len(tables.get('custom_emojis', []))}\n"
         f"📋 Orders: {len(tables.get('orders', []))}\n"
+        f"👥 Users: {len(tables.get('users', []))}\n"
         f"👮 Admins: {len(tables.get('admins', []))}"
     )
 
@@ -830,9 +856,16 @@ def restore_backup(blob):
         # Disable FK checks for this atomic replacement, then re-enable them.
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("BEGIN")
-        for table in ("prices", "custom_prices", "orders", "products", "categories", "currencies", "custom_emojis", "texts", "buttons", "admins", "settings"):
+        restore_order = (
+            "settings", "categories", "currencies", "products", "custom_emojis",
+            "texts", "buttons", "orders", "users", "admins", "prices", "custom_prices",
+        )
+        for table in restore_order:
+            if table not in tables:
+                # A backup from an older version may not contain newer tables.
+                # Never wipe newer live data simply because an old backup lacks it.
+                continue
             conn.execute(f"DELETE FROM {table}")
-        for table in ("settings", "categories", "currencies", "products", "custom_emojis", "texts", "buttons", "orders", "admins", "prices", "custom_prices"):
             for row in tables.get(table, []):
                 if not row:
                     continue
@@ -852,6 +885,16 @@ def restore_backup(blob):
         except Exception:
             pass
         conn.close()
+    # Compatibility with the v4 backups the owner may already have downloaded.
+    # v4 had message cleanup disabled; turn it back ON once for those backups.
+    restored_settings = tables.get("settings", [])
+    has_v5_cleanup_flag = any(
+        row.get("key") == "v5_cleanup_migrated" for row in restored_settings if row
+    )
+    if not has_v5_cleanup_flag:
+        set_setting("delete_user_messages", "1")
+        set_setting("v5_cleanup_migrated", "1")
+
     if BOOTSTRAP_ADMIN_CHAT_ID:
         try:
             add_admin(int(BOOTSTRAP_ADMIN_CHAT_ID), "Bootstrap admin")
@@ -903,6 +946,95 @@ async def send_embedded_script(bot, chat_id):
         caption="📦 <b>UPDATED SCRIPT WITH BACKUP</b>\n\nYour current data is embedded in EMBEDDED_BACKUP.",
         parse_mode="HTML",
     )
+
+
+# ============================================================
+# USER / MESSAGE HISTORY HELPERS
+# ============================================================
+
+
+def upsert_user(user, chat_id=None):
+    if not user:
+        return
+    chat_id = int(chat_id if chat_id is not None else user.id)
+    conn = db()
+    existing = conn.execute(
+        "SELECT created_at FROM users WHERE telegram_id=?", (user.id,)
+    ).fetchone()
+    created_at = existing["created_at"] if existing else now_string()
+    conn.execute(
+        """
+        INSERT INTO users(telegram_id, chat_id, username, first_name, last_name, language_code, created_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(telegram_id) DO UPDATE SET
+            chat_id=excluded.chat_id,
+            username=excluded.username,
+            first_name=excluded.first_name,
+            last_name=excluded.last_name,
+            language_code=excluded.language_code,
+            last_seen_at=excluded.last_seen_at
+        """,
+        (user.id, chat_id, user.username, user.first_name or "", user.last_name or "", user.language_code, created_at, now_string()),
+    )
+    conn.commit(); conn.close()
+
+
+def get_users(limit=30):
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM users ORDER BY last_seen_at DESC, telegram_id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_user_count():
+    conn = db()
+    row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def remember_incoming_message(user, chat_id, message_id):
+    conn = db()
+    conn.execute(
+        "INSERT OR IGNORE INTO tracked_messages(chat_id, message_id, telegram_id, created_at, deleted) VALUES (?, ?, ?, ?, 0)",
+        (chat_id, message_id, user.id, now_string()),
+    )
+    conn.commit(); conn.close()
+
+
+def mark_message_deleted(chat_id, message_id):
+    conn = db()
+    conn.execute(
+        "UPDATE tracked_messages SET deleted=1 WHERE chat_id=? AND message_id=?",
+        (chat_id, message_id),
+    )
+    conn.commit(); conn.close()
+
+
+def get_pending_message_ids(telegram_id, chat_id, limit=100):
+    conn = db()
+    rows = conn.execute(
+        "SELECT message_id FROM tracked_messages WHERE telegram_id=? AND chat_id=? AND deleted=0 ORDER BY message_id DESC LIMIT ?",
+        (telegram_id, chat_id, limit),
+    ).fetchall()
+    conn.close()
+    return [int(row["message_id"]) for row in rows]
+
+
+def set_user_panel_message(user_id, message_id):
+    conn = db()
+    conn.execute("UPDATE users SET panel_message_id=? WHERE telegram_id=?", (message_id, user_id))
+    conn.commit(); conn.close()
+
+
+def get_user_panel_message(user_id):
+    conn = db()
+    row = conn.execute("SELECT panel_message_id FROM users WHERE telegram_id=?", (user_id,)).fetchone()
+    conn.close()
+    return int(row["panel_message_id"]) if row and row["panel_message_id"] else None
 
 
 # ============================================================
@@ -1119,15 +1251,16 @@ def back_button(callback="home"):
 
 async def safe_delete(bot, chat_id, message_id):
     if not message_id:
-        return
+        return False
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
     except (BadRequest, Forbidden, TelegramError):
-        pass
+        return False
 
 
 async def send_or_edit_screen(bot, chat_id, user_id, text, reply_markup=None):
-    message_id = screen_messages.get(user_id)
+    message_id = screen_messages.get(user_id) or get_user_panel_message(user_id)
     if message_id:
         try:
             await bot.edit_message_text(
@@ -1137,6 +1270,8 @@ async def send_or_edit_screen(bot, chat_id, user_id, text, reply_markup=None):
                 parse_mode="HTML",
                 reply_markup=reply_markup,
             )
+            screen_messages[user_id] = message_id
+            set_user_panel_message(user_id, message_id)
             return
         except BadRequest as error:
             if "Message is not modified" in str(error):
@@ -1150,6 +1285,7 @@ async def send_or_edit_screen(bot, chat_id, user_id, text, reply_markup=None):
         reply_markup=reply_markup,
     )
     screen_messages[user_id] = message.message_id
+    set_user_panel_message(user_id, message.message_id)
 
 
 async def edit_screen(query, text, reply_markup=None):
@@ -1162,19 +1298,35 @@ async def edit_screen(query, text, reply_markup=None):
             reply_markup=reply_markup,
         )
         screen_messages[user_id] = query.message.message_id
+        set_user_panel_message(user_id, query.message.message_id)
     except BadRequest as error:
         if "Message is not modified" in str(error):
             screen_messages[user_id] = query.message.message_id
+            set_user_panel_message(user_id, query.message.message_id)
             return
         await send_or_edit_screen(query.get_bot(), chat_id, user_id, text, reply_markup)
 
 
 async def cleanup_user_message(update):
     if not update.message:
-        return
-    if get_setting("delete_user_messages", "0") != "1":
-        return
-    await safe_delete(update.get_bot(), update.effective_chat.id, update.message.message_id)
+        return False
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    message_id = update.message.message_id
+    remember_incoming_message(user, chat_id, message_id)
+    if get_setting("delete_user_messages", "1") != "1":
+        return False
+    deleted = await safe_delete(update.get_bot(), chat_id, message_id)
+    if deleted:
+        mark_message_deleted(chat_id, message_id)
+    return deleted
+
+
+async def clear_tracked_messages(bot, user_id, chat_id):
+    # Retry user-message deletion for messages that could not be removed earlier.
+    for message_id in get_pending_message_ids(user_id, chat_id, 100):
+        if await safe_delete(bot, chat_id, message_id):
+            mark_message_deleted(chat_id, message_id)
 
 
 # ============================================================
@@ -1337,7 +1489,7 @@ def admin_keyboard():
         [InlineKeyboardButton(get_button("emojis", "✨ Custom Emojis"), callback_data="a:emojis")],
         [InlineKeyboardButton("💾 Backup & Restore", callback_data="a:backup"), InlineKeyboardButton("🧰 Miscellaneous", callback_data="a:misc")],
         [InlineKeyboardButton(get_button("settings", "🏪 Shop Settings"), callback_data="a:settings"), InlineKeyboardButton(get_button("admins", "👮 Admins"), callback_data="a:admins")],
-        [InlineKeyboardButton(get_button("orders", "📋 Orders"), callback_data="a:orders")],
+        [InlineKeyboardButton(get_button("orders", "📋 Orders"), callback_data="a:orders"), InlineKeyboardButton(get_button("users", "👥 Users"), callback_data="a:users")],
         [InlineKeyboardButton(get_button("home", "🏠 Main Menu"), callback_data="home")],
     ])
 
@@ -1844,7 +1996,10 @@ def create_order(user, session, roblox_username):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    upsert_user(update.effective_user, update.effective_chat.id)
+    await clear_tracked_messages(context.bot, user_id, update.effective_chat.id)
     sessions.pop(user_id, None)
+    await cleanup_user_message(update)
     await send_or_edit_screen(
         update.get_bot(),
         update.effective_chat.id,
@@ -1855,7 +2010,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    upsert_user(update.effective_user, update.effective_chat.id)
     if not is_admin(update.effective_user):
+        await cleanup_user_message(update)
         await send_or_edit_screen(
             update.get_bot(), update.effective_chat.id, update.effective_user.id,
             "⛔ <b>ACCESS DENIED</b>",
@@ -1863,11 +2020,27 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     sessions.pop(update.effective_user.id, None)
+    await cleanup_user_message(update)
     await send_or_edit_screen(
         update.get_bot(), update.effective_chat.id, update.effective_user.id,
         "⚙️ <b>ADMIN PANEL</b>\n\nEverything is managed directly from Telegram.",
         admin_keyboard(),
     )
+
+
+async def show_users(query):
+    users = get_users(30)
+    lines = ["👥 <b>USERS</b>", "", f"Registered users: <b>{get_user_count()}</b>", ""]
+    if not users:
+        lines.append("No users have interacted with the bot yet.")
+    else:
+        for row in users:
+            if row["username"]:
+                display = "@" + row["username"]
+            else:
+                display = ((row["first_name"] or "") + (" " + row["last_name"] if row["last_name"] else "")).strip() or str(row["telegram_id"])
+            lines.append(f"• <b>{esc(display)}</b> · <code>{row['telegram_id']}</code>")
+    await edit_screen(query, "\n".join(lines), kb([[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]))
 
 
 # ============================================================
@@ -2280,6 +2453,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- Orders ----
     if data == "a:orders":
         await show_orders(query); return
+    if data == "a:users":
+        await show_users(query); return
     if data.startswith("order:"):
         order_number = data.split(":",1)[1]
         o = get_order(order_number)
@@ -2343,6 +2518,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not message.document:
         return
     user = update.effective_user
+    upsert_user(user, update.effective_chat.id)
     session = sessions.get(user.id)
     if not is_admin(user) or not session or session.get("action") != "backup_import":
         return
@@ -2358,6 +2534,8 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb([[InlineKeyboardButton("✅ Restore Backup", callback_data="backup:confirm")], [InlineKeyboardButton("❌ Cancel", callback_data="backup:cancel")]]))
     except Exception as error:
         await send_or_edit_screen(context.bot, update.effective_chat.id, user.id, f"⚠️ <b>INVALID BACKUP</b>\n\n{esc(error)}", cancel_keyboard())
+    finally:
+        await cleanup_user_message(update)
 
 
 # ============================================================
@@ -2371,6 +2549,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     user_id = user.id
+    upsert_user(user, update.effective_chat.id)
     session = sessions.get(user_id)
 
     # /cancel is handled here for sessions, even though it starts with '/'.
