@@ -1,18 +1,12 @@
+
 import os
 import html
-import sqlite3
 import logging
-import re
-import base64
-import hashlib
-import io
-import json
-import zlib
-from pathlib import Path
+import secrets
+import sqlite3
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, InputFile
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
@@ -27,59 +21,30 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-BOOTSTRAP_ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOOTSTRAP_ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
+DATABASE_FILE = os.getenv("DATABASE_FILE", "shop.db")
 
-# Railway: use a Volume mounted at /data for real persistence.
-# You can override this with DATABASE_FILE.
-# For compatibility, an existing older `shop.db` is preferred when the new
-# `srpexchange.db` does not exist, so upgrading the script does not reset data.
-if os.path.isdir("/data"):
-    if os.path.exists("/data/srpexchange.db"):
-        DEFAULT_DB = "/data/srpexchange.db"
-    elif os.path.exists("/data/shop.db"):
-        DEFAULT_DB = "/data/shop.db"
-    else:
-        DEFAULT_DB = "/data/srpexchange.db"
-else:
-    if os.path.exists("srpexchange.db"):
-        DEFAULT_DB = "srpexchange.db"
-    elif os.path.exists("shop.db"):
-        DEFAULT_DB = "shop.db"
-    else:
-        DEFAULT_DB = "srpexchange.db"
-DATABASE_FILE = os.getenv("DATABASE_FILE", DEFAULT_DB).strip()
-
-BOOTSTRAP_ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "berizienuhq").strip().lstrip("@")
-TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Zurich")
-try:
-    BOT_TZ = ZoneInfo(TIMEZONE_NAME)
-except Exception:
-    BOT_TZ = ZoneInfo("UTC")
+# This username is used only as a bootstrap authorization fallback.
+# The admin panel itself stores the customer-facing support username
+# separately, so changing the displayed username does not lock you out.
+DEFAULT_BOOTSTRAP_ADMIN_USERNAME = "berizienuhq"
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger("SRPExchange")
+logger = logging.getLogger(__name__)
 
-# In-memory workflow/session state only. Shop data is SQLite-persistent.
-sessions = {}
-screen_messages = {}
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-
 def db():
-    directory = os.path.dirname(os.path.abspath(DATABASE_FILE))
-    if directory and directory != ".":
-        os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(DATABASE_FILE, timeout=30)
+    conn = sqlite3.connect(DATABASE_FILE)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -92,253 +57,117 @@ def table_columns(conn, table_name):
 
 def ensure_column(conn, table_name, column_name, definition):
     if column_name not in table_columns(conn, table_name):
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
-
-
-def now_string():
-    return datetime.now(BOT_TZ).strftime("%d.%m.%Y %H:%M:%S")
-
-
-DEFAULT_SETTINGS = {
-    "shop_name": "SRPExchange",
-    "admin_username": "@berizienuhq",
-    "order_recipient_chat_id": BOOTSTRAP_ADMIN_CHAT_ID,
-    "max_custom_amount": "1000000",
-    "delete_user_messages": "1",
-    "show_admin_button": "1",
-    "maintenance_mode": "0",
-    "show_product_prices": "0",
-    "customer_order_history": "0",
-    "anti_spam": "0",
-    "anti_spam_seconds": "2",
-    "debug_mode": "0",
-}
-
-# ============================================================================
-# EMBEDDED BACKUP
-# ============================================================================
-# The admin panel can generate a copy of this script with the current database
-# embedded here. A fresh database restores this data automatically.
-EMBEDDED_BACKUP = r""""""
-BACKUP_PREFIX = "SRPEXCHANGE_BACKUP_V1:"
-BACKUP_FORMAT_VERSION = 1
-
-DEFAULT_TEXTS = {
-    "welcome": (
-        "🛍️ <b>{shop_name}</b>\n\n"
-        "Welcome! Choose an option below to get started."
-    ),
-    "category": (
-        "🗂️ <b>SELECT A CATEGORY</b>\n\n"
-        "Choose what you would like to exchange."
-    ),
-    "currency": (
-        "💱 <b>SELECT PAYMENT METHOD</b>\n\n"
-        "Choose the currency you want to use."
-    ),
-    "product": (
-        "📦 <b>{category}</b>\n\n"
-        "Choose an available option below."
-    ),
-    "custom": (
-        "✏️ <b>CUSTOM AMOUNT</b>\n\n"
-        "Send the amount of Robux you want.\n\n"
-        "Example: <code>2500</code>"
-    ),
-    "username": (
-        "👤 <b>ROBLOX USERNAME</b>\n\n"
-        "Send your Roblox username."
-    ),
-    "how": (
-        "ℹ️ <b>HOW IT WORKS</b>\n\n"
-        "1️⃣ Choose a category.\n"
-        "2️⃣ Choose a payment method.\n"
-        "3️⃣ Choose an offer or enter a custom amount.\n"
-        "4️⃣ Enter your Roblox username.\n"
-        "5️⃣ Your order is sent to the admin."
-    ),
-    "confirmation": (
-        "✅ <b>ORDER {order_number}</b>\n\n"
-        "We have received your order.\n\n"
-        "📩 Please wait for a DM from <b>{admin_username}</b> "
-        "to finalise the exchange.\n\n"
-        "Thank you for using <b>{shop_name}</b>."
-    ),
-    "cancelled": "❌ <b>CANCELLED</b>\n\nYour current action has been cancelled.",
-    "no_categories": "🗂️ <b>NO CATEGORIES</b>\n\nThere are currently no available categories.",
-    "no_currencies": "💱 <b>NO CURRENCIES</b>\n\nThere are currently no available payment methods.",
-    "no_products": "📦 <b>NO PRODUCTS</b>\n\nThere are currently no available products here.",
-    "invalid_amount": "⚠️ Please enter a valid amount between 1 and {max_custom_amount}.",
-    "invalid_username": (
-        "⚠️ That doesn't look like a valid Roblox username.\n\n"
-        "Please try again."
-    ),
-    "order_error": (
-        "⚠️ <b>ORDER NOT CREATED</b>\n\n"
-        "Something went wrong while creating your order. Please try again."
-    ),
-    "no_session": "Please open the shop again with /start.",
-    "maintenance": (
-        "🛠️ <b>SHOP TEMPORARILY CLOSED</b>\n\n"
-        "The shop is currently under maintenance. Please check back soon."
-    ),
-    "history": (
-        "📋 <b>YOUR ORDERS</b>\n\n"
-        "Here are your most recent orders."
-    ),
-    "admin_new_order": (
-        "🔔 <b>NEW ORDER</b>\n\n"
-        "🔐 Order: <code>{order_number}</code>\n"
-        "🗂️ Category: <b>{category}</b>\n"
-        "💱 Payment method: <b>{currency}</b>\n"
-        "📦 Product: <b>{product}</b>\n"
-        "💰 Amount: <b>{amount:,} Robux</b>\n"
-        "💵 Price: <b>{price}</b>\n"
-        "👤 Roblox username: <code>{roblox_username}</code>\n"
-        "📅 Created: <b>{created_at}</b>\n"
-        "⏳ Status: <b>Awaiting confirmation</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "👤 Customer: <b>{customer_name}</b>\n"
-        "📱 Telegram: <b>{customer_username}</b>\n"
-        "🆔 Chat ID: <code>{telegram_id}</code>"
-    ),
-    "admin_send_failed": (
-        "⚠️ <b>ORDER SAVED</b>\n\n"
-        "Order <code>{order_number}</code> was saved, but the configured admin chat "
-        "could not be notified.\n\nReason: <code>{error}</code>"
-    ),
-}
-
-DEFAULT_BUTTONS = {
-    "exchange": "💱 Exchange",
-    "how": "ℹ️ How It Works",
-    "back": "↩️ Back",
-    "home": "🏠 Main Menu",
-    "new_order": "💱 New Order",
-    "cancel": "❌ Cancel",
-    "custom": "✏️ Custom Amount",
-    "history": "📋 My Orders",
-    "admin": "⚙️ Admin Panel",
-    "categories": "🗂️ Categories",
-    "currencies": "💱 Currencies",
-    "products": "📦 Products",
-    "prices": "💰 Prices",
-    "texts": "📝 Texts",
-    "buttons": "🔘 Buttons",
-    "settings": "🏪 Shop Settings",
-    "emojis": "✨ Custom Emojis",
-    "orders": "📋 Orders",
-    "users": "👥 Users",
-    "admins": "👮 Admins",
-    "add": "➕ Add",
-    "edit": "✏️ Edit",
-    "delete": "🗑️ Delete",
-    "enable": "🟢 Enable",
-    "disable": "🔴 Disable",
-}
-
-TEXT_LABELS = {
-    "welcome": "👋 Welcome screen",
-    "category": "🗂️ Category screen",
-    "currency": "💱 Currency screen",
-    "product": "📦 Product screen",
-    "custom": "✏️ Custom amount screen",
-    "username": "👤 Username screen",
-    "how": "ℹ️ How it works",
-    "confirmation": "✅ Order confirmation",
-    "cancelled": "❌ Cancelled message",
-    "no_categories": "🗂️ Empty categories",
-    "no_currencies": "💱 Empty currencies",
-    "no_products": "📦 Empty products",
-    "invalid_amount": "⚠️ Invalid amount",
-    "invalid_username": "⚠️ Invalid username",
-    "order_error": "⚠️ Order creation error",
-    "no_session": "🔄 No active session",
-    "maintenance": "🛠️ Maintenance Message",
-    "history": "📋 Customer Order History",
-    "admin_new_order": "🔔 Admin new-order message",
-    "admin_send_failed": "⚠️ Admin notification failure",
-}
-
-BUTTON_LABELS = {k: k.replace("_", " ").title() for k in DEFAULT_BUTTONS}
+        conn.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+        )
 
 
 def init_db():
     conn = db()
     cur = conn.cursor()
 
-    cur.executescript(
+    # Core configuration.
+    cur.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        );
+        )
+        """
+    )
 
+    # Generic customer-facing categories.
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS categories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
+            name TEXT NOT NULL UNIQUE,
             button_text TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            parent_id INTEGER REFERENCES categories(id) ON DELETE RESTRICT
-        );
+            visibility INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    ensure_column(conn, "categories", "visibility", "INTEGER NOT NULL DEFAULT 1")
 
+    # Exchange currencies / payment methods.
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS currencies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             button_text TEXT NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1,
             sort_order INTEGER NOT NULL DEFAULT 0
-        );
+        )
+        """
+    )
 
+    # Products/offers.
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             button_text TEXT NOT NULL,
             amount INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            category_id INTEGER REFERENCES categories(id) ON DELETE RESTRICT,
-            description TEXT NOT NULL DEFAULT '',
-            is_custom INTEGER NOT NULL DEFAULT 0
-        );
+            visibility INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    ensure_column(conn, "products", "category_id", "INTEGER")
+    ensure_column(conn, "products", "description", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "products", "visibility", "INTEGER NOT NULL DEFAULT 1")
 
+    # Price matrix: currency x product.
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS prices (
             currency_id INTEGER NOT NULL,
             product_id INTEGER NOT NULL,
             price TEXT NOT NULL DEFAULT 'NA',
-            PRIMARY KEY(currency_id, product_id),
-            FOREIGN KEY(currency_id) REFERENCES currencies(id) ON DELETE CASCADE,
-            FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
-        );
+            PRIMARY KEY(currency_id, product_id)
+        )
+        """
+    )
 
+    # Price for arbitrary/custom amounts.
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS custom_prices (
             currency_id INTEGER PRIMARY KEY,
-            price TEXT NOT NULL DEFAULT 'NA',
-            FOREIGN KEY(currency_id) REFERENCES currencies(id) ON DELETE CASCADE
-        );
+            price TEXT NOT NULL DEFAULT 'NA'
+        )
+        """
+    )
 
+    # Editable customer/admin text templates.
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS texts (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        );
+        )
+        """
+    )
 
+    # Editable customer button labels.
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS buttons (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        );
+        )
+        """
+    )
 
-        CREATE TABLE IF NOT EXISTS custom_emojis (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            emoji_id TEXT NOT NULL,
-            fallback TEXT NOT NULL DEFAULT '✨',
-            enabled INTEGER NOT NULL DEFAULT 1,
-            sort_order INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
-
+    # Orders.
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             order_number TEXT UNIQUE NOT NULL,
@@ -353,173 +182,293 @@ def init_db():
             roblox_username TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'awaiting_confirmation',
             created_at TEXT NOT NULL
-        );
+        )
+        """
+    )
 
-        CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
-            chat_id INTEGER NOT NULL,
-            username TEXT,
-            first_name TEXT NOT NULL DEFAULT '',
-            last_name TEXT NOT NULL DEFAULT '',
-            language_code TEXT,
-            created_at TEXT NOT NULL,
-            last_seen_at TEXT NOT NULL,
-            panel_message_id INTEGER
-        );
+    # Migrate older order tables without breaking an existing database.
+    ensure_column(conn, "orders", "category", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(
+        conn,
+        "orders",
+        "status",
+        "TEXT NOT NULL DEFAULT 'awaiting_confirmation'",
+    )
 
-        CREATE TABLE IF NOT EXISTS tracked_messages (
-            chat_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL,
-            telegram_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            deleted INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY(chat_id, message_id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_tracked_messages_user
-            ON tracked_messages(telegram_id, deleted);
-
+    # Optional multi-admin list.
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS admins (
             telegram_id INTEGER PRIMARY KEY,
             label TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
-        );
+        )
         """
     )
 
-    # Migrations from the previous SRPExchange builds.
-    ensure_column(conn, "categories", "parent_id", "INTEGER")
-    ensure_column(conn, "categories", "description", "TEXT NOT NULL DEFAULT ''")
-    ensure_column(conn, "categories", "button_text", "TEXT NOT NULL DEFAULT ''")
-    ensure_column(conn, "categories", "enabled", "INTEGER NOT NULL DEFAULT 1")
-    ensure_column(conn, "categories", "sort_order", "INTEGER NOT NULL DEFAULT 0")
+    # Seed settings. Existing customized values are preserved.
+    defaults = {
+        "shop_name": "SRPExchange",
+        "admin_username": "@berizienuhq",
+        "order_recipient_chat_id": BOOTSTRAP_ADMIN_CHAT_ID or "",
+        "max_custom_amount": "1000000",
+        "delete_user_messages": "1",
+    }
 
-    ensure_column(conn, "products", "category_id", "INTEGER")
-    ensure_column(conn, "products", "description", "TEXT NOT NULL DEFAULT ''")
-    ensure_column(conn, "products", "is_custom", "INTEGER NOT NULL DEFAULT 0")
-
-    ensure_column(conn, "orders", "category", "TEXT NOT NULL DEFAULT ''")
-    ensure_column(conn, "orders", "status", "TEXT NOT NULL DEFAULT 'awaiting_confirmation'")
-
-    for key, value in DEFAULT_SETTINGS.items():
+    for key, value in defaults.items():
         cur.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+            """
+            INSERT OR IGNORE INTO settings(key, value)
+            VALUES (?, ?)
+            """,
             (key, value),
         )
 
-    # v4 temporarily disabled message cleanup. On this requested upgrade,
-    # turn it back on once; afterwards the admin toggle is respected normally.
-    cleanup_migrated = cur.execute(
-        "SELECT value FROM settings WHERE key='v5_cleanup_migrated'"
+    # Upgrade the old default brand automatically.
+    current_name = cur.execute(
+        "SELECT value FROM settings WHERE key = 'shop_name'"
     ).fetchone()
-    if not cleanup_migrated:
-        cur.execute("UPDATE settings SET value='1' WHERE key='delete_user_messages'")
-        cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('v5_cleanup_migrated','1')")
-
-    # Preserve old shop name only if it was an old generic value.
-    old_name = cur.execute(
-        "SELECT value FROM settings WHERE key='shop_name'"
-    ).fetchone()
-    if old_name and old_name["value"] == "R$ EXCHANGE":
-        cur.execute("UPDATE settings SET value='SRPExchange' WHERE key='shop_name'")
-
-    for key, value in DEFAULT_TEXTS.items():
+    if current_name and current_name["value"] == "R$ EXCHANGE":
         cur.execute(
-            "INSERT OR IGNORE INTO texts(key, value) VALUES (?, ?)",
-            (key, value),
+            "UPDATE settings SET value = 'SRPExchange' WHERE key = 'shop_name'"
         )
 
-    for key, value in DEFAULT_BUTTONS.items():
-        cur.execute(
-            "INSERT OR IGNORE INTO buttons(key, value) VALUES (?, ?)",
-            (key, value),
-        )
+    # Seed categories only when none exist.
+    category_count = cur.execute(
+        "SELECT COUNT(*) AS n FROM categories"
+    ).fetchone()["n"]
 
-    # Repair empty button_text in migrated categories.
-    cur.execute(
-        "UPDATE categories SET button_text=name WHERE TRIM(button_text)=''"
-    )
-
-    # Seed default category only when none exists.
-    category_count = cur.execute("SELECT COUNT(*) AS n FROM categories").fetchone()["n"]
     if category_count == 0:
         cur.execute(
             """
-            INSERT INTO categories(name, button_text, description, enabled, sort_order, parent_id)
-            VALUES (?, ?, ?, 1, 1, NULL)
+            INSERT INTO categories
+            (name, button_text, description, enabled, sort_order)
+            VALUES (?, ?, ?, 1, ?)
             """,
-            ("Robux", "💎 Robux", "Choose a Robux amount to exchange.",),
+            (
+                "Robux",
+                "💎 Robux",
+                "Choose a Robux amount to exchange.",
+                1,
+            ),
         )
 
-    # Seed default currencies only when none exist.
-    currency_count = cur.execute("SELECT COUNT(*) AS n FROM currencies").fetchone()["n"]
+    # Seed currencies only when none exist.
+    currency_count = cur.execute(
+        "SELECT COUNT(*) AS n FROM currencies"
+    ).fetchone()["n"]
+
     if currency_count == 0:
+        currencies = [
+            ("GRAM", "💎 GRAM", 1),
+            ("Telegram Stars", "⭐ Telegram Stars", 2),
+        ]
         cur.executemany(
             """
-            INSERT INTO currencies(name, button_text, enabled, sort_order)
+            INSERT INTO currencies
+            (name, button_text, enabled, sort_order)
             VALUES (?, ?, 1, ?)
             """,
-            [
-                ("GRAM", "💎 GRAM", 1),
-                ("Telegram Stars", "⭐ Telegram Stars", 2),
-            ],
+            currencies,
         )
 
-    # Put old products into first category when they have no category.
+    # Seed products only when none exist.
+    product_count = cur.execute(
+        "SELECT COUNT(*) AS n FROM products"
+    ).fetchone()["n"]
+
+    if product_count == 0:
+        category_id = cur.execute(
+            "SELECT id FROM categories ORDER BY sort_order, id LIMIT 1"
+        ).fetchone()["id"]
+
+        products = [
+            ("200 Robux", "200 Robux", 200, category_id, 1),
+            ("500 Robux", "500 Robux", 500, category_id, 2),
+            ("700 Robux", "700 Robux", 700, category_id, 3),
+            ("1,000 Robux", "1,000 Robux", 1000, category_id, 4),
+        ]
+
+        cur.executemany(
+            """
+            INSERT INTO products
+            (name, button_text, amount, category_id, enabled, sort_order)
+            VALUES (?, ?, ?, ?, 1, ?)
+            """,
+            products,
+        )
+
+    # Backfill old products into the first category if needed.
     first_category = cur.execute(
         "SELECT id FROM categories ORDER BY sort_order, id LIMIT 1"
     ).fetchone()
     if first_category:
         cur.execute(
-            "UPDATE products SET category_id=? WHERE category_id IS NULL",
+            """
+            UPDATE products
+            SET category_id = ?
+            WHERE category_id IS NULL
+            """,
             (first_category["id"],),
         )
 
-    # Seed old default offers only on a totally empty products table.
-    product_count = cur.execute("SELECT COUNT(*) AS n FROM products").fetchone()["n"]
-    if product_count == 0 and first_category:
-        cur.executemany(
-            """
-            INSERT INTO products(name, button_text, amount, enabled, sort_order, category_id, description, is_custom)
-            VALUES (?, ?, ?, 1, ?, ?, '', ?)
-            """,
-            [
-                ("200 Robux", "200 Robux", 200, 1, first_category["id"], 0),
-                ("500 Robux", "500 Robux", 500, 2, first_category["id"], 0),
-                ("700 Robux", "700 Robux", 700, 3, first_category["id"], 0),
-                ("1,000 Robux", "1,000 Robux", 1000, 4, first_category["id"], 0),
-                ("Custom Amount", "✏️ Custom Amount", 0, 5, first_category["id"], 1),
-            ],
-        )
-
-    # Always ensure every product has a currency price row.
+    # Make sure every product/currency combination has a price row.
     currencies = cur.execute("SELECT id FROM currencies").fetchall()
     products = cur.execute("SELECT id FROM products").fetchall()
-    for c in currencies:
-        for p in products:
+
+    for currency in currencies:
+        for product in products:
             cur.execute(
-                "INSERT OR IGNORE INTO prices(currency_id, product_id, price) VALUES (?, ?, 'NA')",
-                (c["id"], p["id"]),
+                """
+                INSERT OR IGNORE INTO prices(currency_id, product_id, price)
+                VALUES (?, ?, 'NA')
+                """,
+                (currency["id"], product["id"]),
             )
+
+    # Seed editable screens if they do not exist yet.
+    text_defaults = {
+        "welcome": (
+            "🛍️ <b>{shop_name}</b>\n\n"
+            "Welcome! Choose an option below to get started."
+        ),
+        "category": (
+            "🗂️ <b>SELECT A CATEGORY</b>\n\n"
+            "Choose what you would like to exchange."
+        ),
+        "currency": (
+            "💱 <b>SELECT PAYMENT METHOD</b>\n\n"
+            "Choose how you want to pay for your exchange."
+        ),
+        "product": (
+            "📦 <b>SELECT YOUR AMOUNT</b>\n\n"
+            "Choose an available option below."
+        ),
+        "custom": (
+            "✏️ <b>CUSTOM AMOUNT</b>\n\n"
+            "Send the amount of Robux you want.\n\n"
+            "Example: <code>2500</code>"
+        ),
+        "username": (
+            "👤 <b>ROBLOX USERNAME</b>\n\n"
+            "Send your Roblox username."
+        ),
+        "how": (
+            "ℹ️ <b>HOW IT WORKS</b>\n\n"
+            "1️⃣ Choose a category.\n"
+            "2️⃣ Choose a payment method.\n"
+            "3️⃣ Choose an amount or enter a custom amount.\n"
+            "4️⃣ Send your Roblox username.\n"
+            "5️⃣ Your order is sent to the team and awaits confirmation."
+        ),
+        "confirmation": (
+            "✅ <b>ORDER SENT</b>\n\n"
+            "🔐 Order code: <code>{order_number}</code>\n\n"
+            "Your order has been sent and is now <b>awaiting confirmation</b>.\n\n"
+            "For your security, only trust a message that references this exact order code.\n\n"
+            "<b>{shop_name}</b> will contact you here when your order is confirmed."
+        ),
+        "cancelled": (
+            "❌ <b>CANCELLED</b>\n\n"
+            "Your current action has been cancelled."
+        ),
+        "no_categories": (
+            "🗂️ <b>NO CATEGORIES AVAILABLE</b>\n\n"
+            "There are currently no exchange categories available."
+        ),
+        "no_products": (
+            "📦 <b>NO PRODUCTS AVAILABLE</b>\n\n"
+            "There are currently no products in this category."
+        ),
+        "invalid_amount": (
+            "⚠️ Please enter a valid amount between 1 and {max_custom_amount}."
+        ),
+        "invalid_username": (
+            "⚠️ That doesn't look like a valid Roblox username.\n\n"
+            "Please try again."
+        ),
+        "order_error": (
+            "⚠️ <b>ORDER NOT CREATED</b>\n\n"
+            "Something went wrong while creating your order. Please try again."
+        ),
+        "no_session": (
+            "Please open the shop again with /start."
+        ),
+        "admin_new_order": (
+            "🔔 <b>NEW ORDER</b>\n\n"
+            "🔐 Security code: <code>{order_number}</code>\n"
+            "📦 Category: <b>{category}</b>\n"
+            "💱 Payment method: <b>{currency}</b>\n"
+            "📦 Product: <b>{product}</b>\n"
+            "💰 Amount: <b>{amount:,} Robux</b>\n"
+            "💵 Price: <b>{price}</b>\n"
+            "👤 Roblox username: <code>{roblox_username}</code>\n"
+            "📅 Created: <b>{created_at}</b>\n"
+            "⏳ Status: <b>Awaiting confirmation</b>\n\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "👤 Customer: <b>{customer_name}</b>\n"
+            "📱 Telegram: <b>{customer_username}</b>\n"
+            "🆔 Chat ID: <code>{telegram_id}</code>"
+        ),
+        "admin_no_recipient": (
+            "⚠️ <b>ORDER SAVED — ADMIN NOTIFIED FAILED</b>\n\n"
+            "Order <code>{order_number}</code> is stored in the database,\n"
+            "but the configured admin chat could not be reached.\n\n"
+            "Reason: <code>{error}</code>"
+        ),
+    }
+
+    # If an old confirmation template exists, keep it unless it still has
+    # the old generic wording. New installs use the safer anti-impersonation
+    # wording above.
+    for key, value in text_defaults.items():
         cur.execute(
-            "INSERT OR IGNORE INTO custom_prices(currency_id, price) VALUES (?, 'NA')",
-            (c["id"],),
+            """
+            INSERT OR IGNORE INTO texts(key, value)
+            VALUES (?, ?)
+            """,
+            (key, value),
         )
 
-    # Bootstrap admin from Railway variable.
+    button_defaults = {
+        "exchange": "💱 Exchange",
+        "how": "ℹ️ How It Works",
+        "custom": "✏️ Custom Amount",
+        "back": "↩️ Back",
+        "home": "🏠 Main Menu",
+        "new_order": "💱 New Order",
+        "cancel": "❌ Cancel",
+        "categories": "🗂️ Categories",
+    }
+
+    for key, value in button_defaults.items():
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO buttons(key, value)
+            VALUES (?, ?)
+            """,
+            (key, value),
+        )
+
+    # Bootstrap the current owner as an admin when possible.
     if BOOTSTRAP_ADMIN_CHAT_ID:
         try:
             admin_id = int(BOOTSTRAP_ADMIN_CHAT_ID)
             cur.execute(
                 """
-                INSERT OR IGNORE INTO admins(telegram_id, label, enabled, created_at)
+                INSERT OR IGNORE INTO admins
+                (telegram_id, label, enabled, created_at)
                 VALUES (?, ?, 1, ?)
                 """,
-                (admin_id, "Bootstrap admin", now_string()),
+                (
+                    admin_id,
+                    "Bootstrap admin",
+                    datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+                ),
             )
         except ValueError:
-            logger.warning("ADMIN_CHAT_ID must be numeric; username bootstrap may be used.")
+            logger.warning("ADMIN_CHAT_ID is not a numeric Telegram chat ID.")
 
     conn.commit()
     conn.close()
@@ -529,10 +478,12 @@ def init_db():
 # DATABASE HELPERS
 # ============================================================
 
-
 def get_setting(key, default=""):
     conn = db()
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key = ?",
+        (key,),
+    ).fetchone()
     conn.close()
     return row["value"] if row else default
 
@@ -541,8 +492,10 @@ def set_setting(key, value):
     conn = db()
     conn.execute(
         """
-        INSERT INTO settings(key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        INSERT INTO settings(key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value = excluded.value
         """,
         (key, str(value)),
     )
@@ -552,7 +505,10 @@ def set_setting(key, value):
 
 def get_text(key, default=""):
     conn = db()
-    row = conn.execute("SELECT value FROM texts WHERE key=?", (key,)).fetchone()
+    row = conn.execute(
+        "SELECT value FROM texts WHERE key = ?",
+        (key,),
+    ).fetchone()
     conn.close()
     return row["value"] if row else default
 
@@ -561,8 +517,10 @@ def set_text(key, value):
     conn = db()
     conn.execute(
         """
-        INSERT INTO texts(key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        INSERT INTO texts(key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value = excluded.value
         """,
         (key, value),
     )
@@ -571,9 +529,12 @@ def set_text(key, value):
 
 
 def get_button(key, default=None):
-    fallback = key if default is None else default
+    fallback = default if default is not None else key
     conn = db()
-    row = conn.execute("SELECT value FROM buttons WHERE key=?", (key,)).fetchone()
+    row = conn.execute(
+        "SELECT value FROM buttons WHERE key = ?",
+        (key,),
+    ).fetchone()
     conn.close()
     return row["value"] if row else fallback
 
@@ -582,8 +543,10 @@ def set_button(key, value):
     conn = db()
     conn.execute(
         """
-        INSERT INTO buttons(key, value) VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        INSERT INTO buttons(key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key)
+        DO UPDATE SET value = excluded.value
         """,
         (key, value),
     )
@@ -591,85 +554,97 @@ def set_button(key, value):
     conn.close()
 
 
-def get_categories(parent_id=None, enabled_only=False):
+def get_categories(enabled_only=False):
     conn = db()
-    if parent_id is None:
-        parent_clause = "parent_id IS NULL"
-        args = []
-    else:
-        parent_clause = "parent_id=?"
-        args = [parent_id]
-    extra = " AND enabled=1" if enabled_only else ""
-    rows = conn.execute(
-        f"SELECT * FROM categories WHERE {parent_clause}{extra} ORDER BY sort_order, id",
-        tuple(args),
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def get_all_categories(enabled_only=False):
-    conn = db()
-    extra = "WHERE enabled=1" if enabled_only else ""
-    rows = conn.execute(
-        f"SELECT * FROM categories {extra} ORDER BY sort_order, id"
-    ).fetchall()
+    sql = (
+        """
+        SELECT * FROM categories
+        WHERE enabled = 1
+          AND visibility = 1
+        ORDER BY sort_order, id
+        """
+        if enabled_only
+        else
+        """
+        SELECT * FROM categories
+        ORDER BY sort_order, id
+        """
+    )
+    rows = conn.execute(sql).fetchall()
     conn.close()
     return rows
 
 
 def get_category(category_id):
     conn = db()
-    row = conn.execute("SELECT * FROM categories WHERE id=?", (category_id,)).fetchone()
-    conn.close()
-    return row
-
-
-def get_category_children(category_id, enabled_only=False):
-    return get_categories(category_id, enabled_only)
-
-
-def get_products(category_id=None, enabled_only=False):
-    conn = db()
-    conditions = []
-    args = []
-    if category_id is not None:
-        conditions.append("category_id=?")
-        args.append(category_id)
-    if enabled_only:
-        conditions.append("enabled=1")
-    where = " WHERE " + " AND ".join(conditions) if conditions else ""
-    rows = conn.execute(
-        f"SELECT * FROM products{where} ORDER BY sort_order, id", tuple(args)
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def get_all_products():
-    return get_products()
-
-
-def get_product(product_id):
-    conn = db()
-    row = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM categories WHERE id = ?",
+        (category_id,),
+    ).fetchone()
     conn.close()
     return row
 
 
 def get_currencies(enabled_only=False):
     conn = db()
-    extra = "WHERE enabled=1" if enabled_only else ""
-    rows = conn.execute(
-        f"SELECT * FROM currencies {extra} ORDER BY sort_order, id"
-    ).fetchall()
+    sql = (
+        """
+        SELECT * FROM currencies
+        WHERE enabled = 1
+        ORDER BY sort_order, id
+        """
+        if enabled_only
+        else
+        """
+        SELECT * FROM currencies
+        ORDER BY sort_order, id
+        """
+    )
+    rows = conn.execute(sql).fetchall()
     conn.close()
     return rows
 
 
 def get_currency(currency_id):
     conn = db()
-    row = conn.execute("SELECT * FROM currencies WHERE id=?", (currency_id,)).fetchone()
+    row = conn.execute(
+        "SELECT * FROM currencies WHERE id = ?",
+        (currency_id,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def get_products(category_id=None, enabled_only=False):
+    conn = db()
+    query = "SELECT * FROM products"
+    args = []
+    conditions = []
+
+    if category_id is not None:
+        conditions.append("category_id = ?")
+        args.append(category_id)
+
+    if enabled_only:
+        conditions.append("enabled = 1")
+        conditions.append("visibility = 1")
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+
+    query += " ORDER BY sort_order, id"
+
+    rows = conn.execute(query, tuple(args)).fetchall()
+    conn.close()
+    return rows
+
+
+def get_product(product_id):
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM products WHERE id = ?",
+        (product_id,),
+    ).fetchone()
     conn.close()
     return row
 
@@ -677,7 +652,12 @@ def get_currency(currency_id):
 def get_price(currency_id, product_id):
     conn = db()
     row = conn.execute(
-        "SELECT price FROM prices WHERE currency_id=? AND product_id=?",
+        """
+        SELECT price
+        FROM prices
+        WHERE currency_id = ?
+          AND product_id = ?
+        """,
         (currency_id, product_id),
     ).fetchone()
     conn.close()
@@ -688,8 +668,10 @@ def set_price(currency_id, product_id, price):
     conn = db()
     conn.execute(
         """
-        INSERT INTO prices(currency_id, product_id, price) VALUES (?, ?, ?)
-        ON CONFLICT(currency_id, product_id) DO UPDATE SET price=excluded.price
+        INSERT INTO prices(currency_id, product_id, price)
+        VALUES (?, ?, ?)
+        ON CONFLICT(currency_id, product_id)
+        DO UPDATE SET price = excluded.price
         """,
         (currency_id, product_id, price.strip() or "NA"),
     )
@@ -700,7 +682,7 @@ def set_price(currency_id, product_id, price):
 def get_custom_price(currency_id):
     conn = db()
     row = conn.execute(
-        "SELECT price FROM custom_prices WHERE currency_id=?",
+        "SELECT price FROM custom_prices WHERE currency_id = ?",
         (currency_id,),
     ).fetchone()
     conn.close()
@@ -711,8 +693,10 @@ def set_custom_price(currency_id, price):
     conn = db()
     conn.execute(
         """
-        INSERT INTO custom_prices(currency_id, price) VALUES (?, ?)
-        ON CONFLICT(currency_id) DO UPDATE SET price=excluded.price
+        INSERT INTO custom_prices(currency_id, price)
+        VALUES (?, ?)
+        ON CONFLICT(currency_id)
+        DO UPDATE SET price = excluded.price
         """,
         (currency_id, price.strip() or "NA"),
     )
@@ -720,10 +704,16 @@ def set_custom_price(currency_id, price):
     conn.close()
 
 
-def get_orders(limit=40):
+def get_orders(limit=30):
     conn = db()
     rows = conn.execute(
-        "SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,)
+        """
+        SELECT *
+        FROM orders
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
     ).fetchall()
     conn.close()
     return rows
@@ -732,7 +722,8 @@ def get_orders(limit=40):
 def get_order(order_number):
     conn = db()
     row = conn.execute(
-        "SELECT * FROM orders WHERE order_number=?", (order_number,)
+        "SELECT * FROM orders WHERE order_number = ?",
+        (order_number,),
     ).fetchone()
     conn.close()
     return row
@@ -741,20 +732,11 @@ def get_order(order_number):
 def set_order_status(order_number, status):
     conn = db()
     conn.execute(
-        "UPDATE orders SET status=? WHERE order_number=?",
+        "UPDATE orders SET status = ? WHERE order_number = ?",
         (status, order_number),
     )
     conn.commit()
     conn.close()
-
-
-def get_admins():
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM admins ORDER BY created_at, telegram_id"
-    ).fetchall()
-    conn.close()
-    return rows
 
 
 def add_admin(telegram_id, label=""):
@@ -763,9 +745,14 @@ def add_admin(telegram_id, label=""):
         """
         INSERT INTO admins(telegram_id, label, enabled, created_at)
         VALUES (?, ?, 1, ?)
-        ON CONFLICT(telegram_id) DO UPDATE SET label=excluded.label, enabled=1
+        ON CONFLICT(telegram_id)
+        DO UPDATE SET label = excluded.label, enabled = 1
         """,
-        (telegram_id, label, now_string()),
+        (
+            telegram_id,
+            label,
+            datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+        ),
     )
     conn.commit()
     conn.close()
@@ -773,2184 +760,3490 @@ def add_admin(telegram_id, label=""):
 
 def remove_admin(telegram_id):
     conn = db()
-    conn.execute("DELETE FROM admins WHERE telegram_id=?", (telegram_id,))
+    conn.execute(
+        "DELETE FROM admins WHERE telegram_id = ?",
+        (telegram_id,),
+    )
     conn.commit()
     conn.close()
 
 
-# ============================================================
-# PORTABLE BACKUP / RESTORE
-# ============================================================
-
-BACKUP_TABLES = (
-    "settings", "categories", "currencies", "products", "prices",
-    "custom_prices", "texts", "buttons", "custom_emojis", "orders", "users", "admins",
-)
-
-
-def _table_rows(conn, table):
-    return [dict(row) for row in conn.execute(f"SELECT * FROM {table}").fetchall()]
-
-
-def make_backup_payload():
-    conn = db()
-    tables = {table: _table_rows(conn, table) for table in BACKUP_TABLES}
-    conn.close()
-    return {"format": BACKUP_FORMAT_VERSION, "exported_at": now_string(), "tables": tables}
-
-
-def encode_backup(payload=None):
-    payload = payload or make_backup_payload()
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    envelope = {
-        "format": BACKUP_FORMAT_VERSION,
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        "data": base64.b64encode(zlib.compress(raw, 9)).decode("ascii"),
-    }
-    return BACKUP_PREFIX + json.dumps(envelope, separators=(",", ":"))
-
-
-def decode_backup(blob):
-    blob = (blob or "").strip()
-    if not blob:
-        raise ValueError("Backup is empty.")
-    if not blob.startswith(BACKUP_PREFIX):
-        try:
-            payload = json.loads(blob)
-            if "tables" in payload:
-                return payload
-        except Exception:
-            pass
-        raise ValueError("This is not a valid SRPExchange backup.")
-    envelope = json.loads(blob[len(BACKUP_PREFIX):])
-    if envelope.get("format") != BACKUP_FORMAT_VERSION:
-        raise ValueError("Unsupported backup version.")
-    raw = zlib.decompress(base64.b64decode(envelope["data"]))
-    if hashlib.sha256(raw).hexdigest() != envelope.get("sha256"):
-        raise ValueError("Backup checksum failed.")
-    payload = json.loads(raw.decode("utf-8"))
-    if "tables" not in payload:
-        raise ValueError("Backup contains no database data.")
-    return payload
-
-
-def backup_summary(payload=None):
-    tables = (payload or make_backup_payload()).get("tables", {})
-    return (
-        f"🗂️ Categories: {len(tables.get('categories', []))}\n"
-        f"📦 Products: {len(tables.get('products', []))}\n"
-        f"💱 Currencies: {len(tables.get('currencies', []))}\n"
-        f"✨ Custom emojis: {len(tables.get('custom_emojis', []))}\n"
-        f"📋 Orders: {len(tables.get('orders', []))}\n"
-        f"👥 Users: {len(tables.get('users', []))}\n"
-        f"👮 Admins: {len(tables.get('admins', []))}"
-    )
-
-
-def restore_backup(blob):
-    payload = decode_backup(blob)
-    tables = payload.get("tables", {})
-    conn = db()
-    try:
-        # Backups may contain nested categories whose parents are restored later.
-        # Disable FK checks for this atomic replacement, then re-enable them.
-        conn.execute("PRAGMA foreign_keys = OFF")
-        conn.execute("BEGIN")
-        restore_order = (
-            "settings", "categories", "currencies", "products", "custom_emojis",
-            "texts", "buttons", "orders", "users", "admins", "prices", "custom_prices",
-        )
-        for table in restore_order:
-            if table not in tables:
-                # A backup from an older version may not contain newer tables.
-                # Never wipe newer live data simply because an old backup lacks it.
-                continue
-            conn.execute(f"DELETE FROM {table}")
-            for row in tables.get(table, []):
-                if not row:
-                    continue
-                columns = list(row.keys())
-                marks = ",".join("?" for _ in columns)
-                conn.execute(
-                    f"INSERT INTO {table} ({','.join(columns)}) VALUES ({marks})",
-                    [row[c] for c in columns],
-                )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        try:
-            conn.execute("PRAGMA foreign_keys = ON")
-        except Exception:
-            pass
-        conn.close()
-    # Compatibility with the v4 backups the owner may already have downloaded.
-    # v4 had message cleanup disabled; turn it back ON once for those backups.
-    restored_settings = tables.get("settings", [])
-    has_v5_cleanup_flag = any(
-        row.get("key") == "v5_cleanup_migrated" for row in restored_settings if row
-    )
-    if not has_v5_cleanup_flag:
-        set_setting("delete_user_messages", "1")
-        set_setting("v5_cleanup_migrated", "1")
-
-    if BOOTSTRAP_ADMIN_CHAT_ID:
-        try:
-            add_admin(int(BOOTSTRAP_ADMIN_CHAT_ID), "Bootstrap admin")
-        except ValueError:
-            pass
-    return payload
-
-
-def load_embedded_backup_if_fresh(fresh_db):
-    blob = EMBEDDED_BACKUP.strip()
-    if not fresh_db or not blob:
-        return False
-    try:
-        payload = restore_backup(blob)
-        logger.info("Embedded backup restored: %s", backup_summary(payload).replace("\n", " | "))
-        return True
-    except Exception:
-        logger.exception("Embedded backup could not be restored")
-        return False
-
-
-def embed_backup_in_source(source_text, backup_blob):
-    pattern = re.compile(
-        r'(?s)(# ============================================================================\n# EMBEDDED BACKUP\n# ============================================================================\n.*?EMBEDDED_BACKUP = r""").*?("""\nBACKUP_PREFIX =)'
-    )
-    updated, count = pattern.subn(lambda m: m.group(1) + backup_blob + m.group(2), source_text, count=1)
-    if count != 1:
-        raise RuntimeError("Embedded backup section was not found.")
-    return updated
-
-
-def build_script_with_current_backup():
-    source = Path(__file__).resolve().read_text(encoding="utf-8")
-    return embed_backup_in_source(source, encode_backup())
-
-
-async def send_backup_file(bot, chat_id):
-    stream = io.BytesIO(encode_backup().encode("utf-8"))
-    stream.name = "srpexchange_backup.txt"
-    await bot.send_document(chat_id=chat_id, document=InputFile(stream, filename="srpexchange_backup.txt"), caption="💾 Current SRPExchange backup.")
-
-
-async def send_embedded_script(bot, chat_id):
-    stream = io.BytesIO(build_script_with_current_backup().encode("utf-8"))
-    stream.name = "main_with_backup.py"
-    await bot.send_document(
-        chat_id=chat_id,
-        document=InputFile(stream, filename="main_with_backup.py"),
-        caption="📦 <b>UPDATED SCRIPT WITH BACKUP</b>\n\nYour current data is embedded in EMBEDDED_BACKUP.",
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# USER / MESSAGE HISTORY HELPERS
-# ============================================================
-
-
-def upsert_user(user, chat_id=None):
-    if not user:
-        return
-    chat_id = int(chat_id if chat_id is not None else user.id)
-    conn = db()
-    existing = conn.execute(
-        "SELECT created_at FROM users WHERE telegram_id=?", (user.id,)
-    ).fetchone()
-    created_at = existing["created_at"] if existing else now_string()
-    conn.execute(
-        """
-        INSERT INTO users(telegram_id, chat_id, username, first_name, last_name, language_code, created_at, last_seen_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(telegram_id) DO UPDATE SET
-            chat_id=excluded.chat_id,
-            username=excluded.username,
-            first_name=excluded.first_name,
-            last_name=excluded.last_name,
-            language_code=excluded.language_code,
-            last_seen_at=excluded.last_seen_at
-        """,
-        (user.id, chat_id, user.username, user.first_name or "", user.last_name or "", user.language_code, created_at, now_string()),
-    )
-    conn.commit(); conn.close()
-
-
-def get_users(limit=30):
+def get_admins():
     conn = db()
     rows = conn.execute(
-        "SELECT * FROM users ORDER BY last_seen_at DESC, telegram_id DESC LIMIT ?",
-        (limit,),
+        """
+        SELECT *
+        FROM admins
+        ORDER BY created_at, telegram_id
+        """
     ).fetchall()
     conn.close()
     return rows
 
 
-def get_user_count():
-    conn = db()
-    row = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()
-    conn.close()
-    return int(row["n"]) if row else 0
-
-
-def remember_incoming_message(user, chat_id, message_id):
-    conn = db()
-    conn.execute(
-        "INSERT OR IGNORE INTO tracked_messages(chat_id, message_id, telegram_id, created_at, deleted) VALUES (?, ?, ?, ?, 0)",
-        (chat_id, message_id, user.id, now_string()),
-    )
-    conn.commit(); conn.close()
-
-
-def mark_message_deleted(chat_id, message_id):
-    conn = db()
-    conn.execute(
-        "UPDATE tracked_messages SET deleted=1 WHERE chat_id=? AND message_id=?",
-        (chat_id, message_id),
-    )
-    conn.commit(); conn.close()
-
-
-def get_pending_message_ids(telegram_id, chat_id, limit=100):
-    conn = db()
-    rows = conn.execute(
-        "SELECT message_id FROM tracked_messages WHERE telegram_id=? AND chat_id=? AND deleted=0 ORDER BY message_id DESC LIMIT ?",
-        (telegram_id, chat_id, limit),
-    ).fetchall()
-    conn.close()
-    return [int(row["message_id"]) for row in rows]
-
-
-def set_user_panel_message(user_id, message_id):
-    conn = db()
-    conn.execute("UPDATE users SET panel_message_id=? WHERE telegram_id=?", (message_id, user_id))
-    conn.commit(); conn.close()
-
-
-def get_user_panel_message(user_id):
-    conn = db()
-    row = conn.execute("SELECT panel_message_id FROM users WHERE telegram_id=?", (user_id,)).fetchone()
-    conn.close()
-    return int(row["panel_message_id"]) if row and row["panel_message_id"] else None
-
-
 # ============================================================
-# CUSTOM EMOJI HELPERS
+# SECURITY / AUTH
 # ============================================================
-
-
-def get_emojis(enabled_only=False):
-    conn = db()
-    extra = "WHERE enabled=1" if enabled_only else ""
-    rows = conn.execute(
-        f"SELECT * FROM custom_emojis {extra} ORDER BY sort_order, id"
-    ).fetchall()
-    conn.close()
-    return rows
-
-
-def get_emoji(emoji_id):
-    conn = db()
-    row = conn.execute(
-        "SELECT * FROM custom_emojis WHERE id=?", (emoji_id,)
-    ).fetchone()
-    conn.close()
-    return row
-
-
-def get_emoji_by_name(name):
-    conn = db()
-    row = conn.execute(
-        "SELECT * FROM custom_emojis WHERE lower(name)=lower(?)", (name,)
-    ).fetchone()
-    conn.close()
-    return row
-
-
-def add_emoji(name, emoji_id, fallback):
-    conn = db()
-    next_order = conn.execute(
-        "SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM custom_emojis"
-    ).fetchone()["n"]
-    conn.execute(
-        """
-        INSERT INTO custom_emojis(name, emoji_id, fallback, enabled, sort_order, created_at)
-        VALUES (?, ?, ?, 1, ?, ?)
-        """,
-        (name, emoji_id, fallback, next_order, now_string()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def update_emoji_name(emoji_id, name):
-    conn = db()
-    conn.execute("UPDATE custom_emojis SET name=? WHERE id=?", (name, emoji_id))
-    conn.commit()
-    conn.close()
-
-
-def delete_emoji(emoji_id):
-    conn = db()
-    conn.execute("DELETE FROM custom_emojis WHERE id=?", (emoji_id,))
-    conn.commit()
-    conn.close()
-
-
-def toggle_emoji(emoji_id):
-    conn = db()
-    conn.execute(
-        "UPDATE custom_emojis SET enabled=CASE WHEN enabled=1 THEN 0 ELSE 1 END WHERE id=?",
-        (emoji_id,),
-    )
-    conn.commit()
-    conn.close()
-
-
-# ============================================================
-# AUTH / FORMATTING
-# ============================================================
-
 
 def is_admin(user):
     if not user:
         return False
-    # Admin authorization is ID-based only. Usernames can change and should
-    # never be sufficient to grant control of the shop.
+
+    # Preserve the environment bootstrap admin.
     if BOOTSTRAP_ADMIN_CHAT_ID:
         try:
             if user.id == int(BOOTSTRAP_ADMIN_CHAT_ID):
                 return True
         except ValueError:
             pass
+
+    if user.username and user.username.lower() == DEFAULT_BOOTSTRAP_ADMIN_USERNAME.lower():
+        return True
+
     conn = db()
     row = conn.execute(
-        "SELECT 1 FROM admins WHERE telegram_id=? AND enabled=1",
+        """
+        SELECT 1
+        FROM admins
+        WHERE telegram_id = ?
+          AND enabled = 1
+        """,
         (user.id,),
     ).fetchone()
     conn.close()
     return row is not None
 
 
-def esc(value):
-    return html.escape(str(value))
-
-
-CUSTOM_EMOJI_TOKEN_RE = re.compile(r"\{\{emoji:([A-Za-z0-9_-]+)\}\}")
-
-
-def replace_emoji_tokens(text):
-    """Replace {{emoji:name}} with Telegram HTML custom-emoji tags."""
-    def repl(match):
-        name = match.group(1)
-        row = get_emoji_by_name(name)
-        if not row or not row["enabled"]:
-            return match.group(0)
-        fallback = esc(row["fallback"] or "✨")
-        return f'<tg-emoji emoji-id="{esc(row["emoji_id"])}">{fallback}</tg-emoji>'
-    return CUSTOM_EMOJI_TOKEN_RE.sub(repl, text)
-
-
-def render_text(key, **values):
-    data = {
-        "shop_name": esc(get_setting("shop_name", "SRPExchange")),
-        "admin_username": esc(get_setting("admin_username", "@berizienuhq")),
-        "max_custom_amount": esc(get_setting("max_custom_amount", "1000000")),
-    }
-    for k, v in values.items():
-        # Most dynamic values appear inside HTML. Keep markup safe.
-        data[k] = esc(v) if isinstance(v, str) else v
-    template = get_text(key, "")
-    # Resolve custom emoji tokens before str.format(), otherwise {{emoji:name}}
-    # becomes {emoji:name} before the custom-emoji parser sees it.
-    template = replace_emoji_tokens(template)
-    try:
-        rendered = template.format(**data)
-    except Exception:
-        rendered = template
-    return rendered
-
-
-def text_label(key):
-    return TEXT_LABELS.get(key, key.replace("_", " ").title())
-
-
-def user_display(user):
-    if getattr(user, "username", None):
-        return "@" + user.username
-    return user.full_name or str(user.id)
-
-
-def valid_roblox_username(value):
-    username = value.lstrip("@").strip()
-    return 3 <= len(username) <= 20 and bool(re.fullmatch(r"[A-Za-z0-9_]+", username))
-
-
-def current_category_path(category_id):
-    pieces = []
-    current = get_category(category_id)
-    seen = set()
-    while current and current["id"] not in seen:
-        seen.add(current["id"])
-        pieces.append(current["name"])
-        current = get_category(current["parent_id"]) if current["parent_id"] else None
-    return " / ".join(reversed(pieces))
-
-
-def would_create_cycle(category_id, new_parent_id):
-    if new_parent_id is None:
-        return False
-    if category_id == new_parent_id:
-        return True
-    current = get_category(new_parent_id)
-    seen = set()
-    while current:
-        if current["id"] in seen:
-            return True
-        seen.add(current["id"])
-        if current["id"] == category_id:
-            return True
-        current = get_category(current["parent_id"]) if current["parent_id"] else None
-    return False
-
-
 # ============================================================
-# SCREEN / UX HELPERS
+# SESSION / CLEAN SCREEN
 # ============================================================
 
-
-def kb(rows):
-    return InlineKeyboardMarkup(rows)
-
-
-def two_col(buttons, bottom=None):
-    rows = []
-    current = []
-    for button in buttons:
-        current.append(button)
-        if len(current) == 2:
-            rows.append(current)
-            current = []
-    if current:
-        rows.append(current)
-    if bottom:
-        rows.extend(bottom)
-    return kb(rows)
+sessions = {}
+# Last customer/admin screen message per user. Kept outside sessions so
+# clearing a workflow never loses the message that must be deleted next.
+screen_messages = {}
 
 
-def admin_bottom():
-    return [[InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")]]
-
-
-def back_button(callback="home"):
-    return InlineKeyboardButton(get_button("back", "↩️ Back"), callback_data=callback)
+def session_for(user_id):
+    return sessions.setdefault(user_id, {})
 
 
 async def safe_delete(bot, chat_id, message_id):
     if not message_id:
-        return False
+        return
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        return True
     except (BadRequest, Forbidden, TelegramError):
-        return False
+        pass
 
 
-async def send_or_edit_screen(bot, chat_id, user_id, text, reply_markup=None):
-    message_id = screen_messages.get(user_id) or get_user_panel_message(user_id)
-    if message_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                parse_mode="HTML",
-                reply_markup=reply_markup,
-            )
-            screen_messages[user_id] = message_id
-            set_user_panel_message(user_id, message_id)
-            return
-        except BadRequest as error:
-            if "Message is not modified" in str(error):
-                return
-        except TelegramError:
-            pass
+async def remember_screen(
+    bot,
+    chat_id,
+    user_id,
+    text,
+    reply_markup=None,
+    parse_mode="HTML",
+    delete_previous=True,
+):
+    # IMPORTANT: the screen message must NOT live inside `sessions`.
+    # Workflows frequently call sessions.pop(...) when they finish, and
+    # doing that used to erase the ID of the previous bot message. The next
+    # /start therefore could not delete it, causing messages to pile up.
+    previous_message_id = screen_messages.get(user_id)
+
+    if delete_previous and previous_message_id:
+        await safe_delete(bot, chat_id, previous_message_id)
+
     message = await bot.send_message(
         chat_id=chat_id,
         text=text,
-        parse_mode="HTML",
+        parse_mode=parse_mode,
         reply_markup=reply_markup,
     )
+
     screen_messages[user_id] = message.message_id
-    set_user_panel_message(user_id, message.message_id)
+    return message
 
 
-async def edit_screen(query, text, reply_markup=None):
-    user_id = query.from_user.id
+async def edit_screen(
+    query,
+    user_id,
+    text,
+    reply_markup=None,
+    parse_mode="HTML",
+):
+    bot = query.get_bot()
     chat_id = query.message.chat_id
+
     try:
+        # Inline navigation edits ONE existing screen instead of creating a
+        # new message. This is the cleanest Telegram UX.
         await query.edit_message_text(
             text=text,
-            parse_mode="HTML",
+            parse_mode=parse_mode,
             reply_markup=reply_markup,
         )
         screen_messages[user_id] = query.message.message_id
-        set_user_panel_message(user_id, query.message.message_id)
     except BadRequest as error:
+        # Telegram returns this when the requested content is identical.
         if "Message is not modified" in str(error):
             screen_messages[user_id] = query.message.message_id
-            set_user_panel_message(user_id, query.message.message_id)
             return
-        await send_or_edit_screen(query.get_bot(), chat_id, user_id, text, reply_markup)
+
+        # If the old screen disappeared (manual deletion, message expiry,
+        # etc.), create exactly ONE replacement and remember its ID.
+        try:
+            await safe_delete(
+                bot,
+                chat_id,
+                screen_messages.get(user_id),
+            )
+            message = await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            screen_messages[user_id] = message.message_id
+        except TelegramError:
+            raise
 
 
-async def cleanup_user_message(update):
+async def clear_user_message(update):
+    """Best-effort cleanup.
+
+    Telegram permissions vary by chat type. In private chats this may fail,
+    so the exception is intentionally ignored.
+    """
     if not update.message:
-        return False
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    message_id = update.message.message_id
-    remember_incoming_message(user, chat_id, message_id)
+        return
     if get_setting("delete_user_messages", "1") != "1":
-        return False
-    deleted = await safe_delete(update.get_bot(), chat_id, message_id)
-    if deleted:
-        mark_message_deleted(chat_id, message_id)
-    return deleted
-
-
-async def clear_tracked_messages(bot, user_id, chat_id):
-    # Retry user-message deletion for messages that could not be removed earlier.
-    for message_id in get_pending_message_ids(user_id, chat_id, 100):
-        if await safe_delete(bot, chat_id, message_id):
-            mark_message_deleted(chat_id, message_id)
-
-
-# ============================================================
-# CUSTOMER KEYBOARDS / SCREENS
-# ============================================================
-
-
-def main_keyboard(user):
-    rows = [
-        [InlineKeyboardButton(get_button("exchange", "💱 Exchange"), callback_data="exchange")],
-        [InlineKeyboardButton(get_button("how", "ℹ️ How It Works"), callback_data="how")],
-    ]
-    if get_setting("customer_order_history", "0") == "1":
-        rows.append([InlineKeyboardButton(get_button("history", "📋 My Orders"), callback_data="history")])
-    if is_admin(user) and get_setting("show_admin_button", "1") == "1":
-        rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
-    return kb(rows)
-
-
-def category_keyboard(parent_id=None, include_back=True):
-    categories = get_categories(parent_id, True)
-    rows = [
-        [InlineKeyboardButton(c["button_text"], callback_data=f"cat:{c['id']}")]
-        for c in categories
-    ]
-    if include_back:
-        rows.append([back_button("home") if parent_id is None else back_button(f"catback:{parent_id}")])
-    return kb(rows)
-
-
-def currency_keyboard(category_id):
-    rows = [
-        [InlineKeyboardButton(c["button_text"], callback_data=f"cur:{category_id}:{c['id']}")]
-        for c in get_currencies(True)
-    ]
-    rows.append([back_button("exchange")])
-    return kb(rows)
-
-
-def product_keyboard(category_id, currency_id):
-    products = get_products(category_id, True)
-    show_prices = get_setting("show_product_prices", "0") == "1"
-    rows = []
-    row = []
-    for p in products:
-        label = p["button_text"]
-        if show_prices:
-            label = f"{label} · {get_custom_price(currency_id) if p['is_custom'] else get_price(currency_id, p['id'])}"
-        row.append(InlineKeyboardButton(label, callback_data=f"prod:{currency_id}:{p['id']}"))
-        if len(row) == 2:
-            rows.append(row); row=[]
-    if row:
-        rows.append(row)
-    rows.append([back_button(f"curback:{category_id}")])
-    return kb(rows)
-
-
-def cancel_keyboard():
-    return kb([[InlineKeyboardButton(get_button("cancel", "❌ Cancel"), callback_data="home")]])
-
-
-def order_end_keyboard():
-    return kb([
-        [InlineKeyboardButton(get_button("new_order", "💱 New Order"), callback_data="exchange")],
-        [InlineKeyboardButton(get_button("home", "🏠 Main Menu"), callback_data="home")],
-    ])
-
-
-async def show_home_query(query):
-    sessions.pop(query.from_user.id, None)
-    await edit_screen(query, render_text("welcome"), main_keyboard(query.from_user))
-
-
-async def show_exchange(query):
-    if get_setting("maintenance_mode", "0") == "1" and not is_admin(query.from_user):
-        await edit_screen(query, render_text("maintenance"), kb([[back_button("home")]]))
         return
-    categories = get_categories(None, True)
-    if not categories:
-        await edit_screen(query, render_text("no_categories"), kb([[back_button("home")]]))
-        return
-    await edit_screen(query, render_text("category"), category_keyboard(None, True))
-
-
-async def show_category(query, category_id):
-    category = get_category(category_id)
-    if not category or not category["enabled"]:
-        await query.answer("This category is unavailable.", show_alert=True)
-        return
-
-    children = get_category_children(category_id, True)
-    products = get_products(category_id, True)
-
-    if children:
-        rows = [[InlineKeyboardButton(c["button_text"], callback_data=f"cat:{c['id']}")] for c in children]
-        if products:
-            rows.append([InlineKeyboardButton("📦 Products", callback_data=f"catprod:{category_id}")])
-        rows.append([back_button("exchange") if category["parent_id"] is None else back_button(f"catback:{category['parent_id']}")])
-        text = category["description"] or render_text("category")
-        await edit_screen(query, f"🗂️ <b>{esc(category['name'])}</b>\n\n{esc(text)}", kb(rows))
-        return
-
-    # No children: proceed to currency selection for this category.
-    session = sessions.setdefault(query.from_user.id, {})
-    session["category_id"] = category_id
-    session.pop("currency_id", None)
-    await edit_screen(
-        query,
-        render_text("currency"),
-        currency_keyboard(category_id),
+    await safe_delete(
+        update.get_bot(),
+        update.effective_chat.id,
+        update.message.message_id,
     )
 
 
-async def show_category_products(query, category_id, currency_id=None):
-    category = get_category(category_id)
-    if not category:
-        await query.answer("Category not found.", show_alert=True)
+# ============================================================
+# FORMATTING
+# ============================================================
+
+def clean(value):
+    return html.escape(str(value))
+
+
+def render_text(key, **extra):
+    values = {
+        "shop_name": clean(get_setting("shop_name", "SRPExchange")),
+        "admin_username": clean(get_setting("admin_username", "@berizienuhq")),
+        "max_custom_amount": clean(get_setting("max_custom_amount", "1000000")),
+        "order_recipient_chat_id": clean(
+            get_setting("order_recipient_chat_id", "")
+        ),
+    }
+    values.update(
+        {
+            key_: (
+                clean(value)
+                if isinstance(value, str)
+                else value
+            )
+            for key_, value in extra.items()
+        }
+    )
+
+    template = get_text(key, "")
+    if not template:
+        return ""
+
+    try:
+        return template.format(**values)
+    except (KeyError, ValueError, IndexError):
+        # A malformed admin template should never crash the bot.
+        return template
+
+
+# ============================================================
+# CUSTOMER KEYBOARDS
+# ============================================================
+
+def two_column_keyboard(buttons, bottom=None):
+    rows = []
+    row = []
+
+    for button in buttons:
+        row.append(button)
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    if bottom:
+        rows.extend(bottom)
+
+    return InlineKeyboardMarkup(rows)
+
+
+def main_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    get_button("exchange", "💱 Exchange"),
+                    callback_data="exchange",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    get_button("how", "ℹ️ How It Works"),
+                    callback_data="how",
+                )
+            ],
+        ]
+    )
+
+
+def category_keyboard():
+    buttons = [
+        InlineKeyboardButton(
+            category["button_text"],
+            callback_data=f"category:{category['id']}",
+        )
+        for category in get_categories(True)
+    ]
+    return two_column_keyboard(
+        buttons,
+        bottom=[
+            [
+                InlineKeyboardButton(
+                    get_button("home", "🏠 Main Menu"),
+                    callback_data="home",
+                )
+            ]
+        ],
+    )
+
+
+def currency_keyboard():
+    buttons = [
+        InlineKeyboardButton(
+            currency["button_text"],
+            callback_data=f"currency:{currency['id']}",
+        )
+        for currency in get_currencies(True)
+    ]
+
+    return two_column_keyboard(
+        buttons,
+        bottom=[
+            [
+                InlineKeyboardButton(
+                    get_button("back", "↩️ Back"),
+                    callback_data="exchange",
+                )
+            ]
+        ],
+    )
+
+
+def product_keyboard(category_id, currency_id):
+    session_products = get_products(category_id, True)
+    buttons = []
+
+    for product in session_products:
+        price = get_price(currency_id, product["id"])
+        label = product["button_text"]
+
+        # Price is appended only when configured, keeping buttons compact.
+        if price and price.upper() != "NA":
+            label = f"{label} · {price}"
+
+        buttons.append(
+            InlineKeyboardButton(
+                label,
+                callback_data=f"product:{product['id']}",
+            )
+        )
+
+    buttons.append(
+        InlineKeyboardButton(
+            get_button("custom", "✏️ Custom Amount"),
+            callback_data="custom",
+        )
+    )
+
+    return two_column_keyboard(
+        buttons,
+        bottom=[
+            [
+                InlineKeyboardButton(
+                    get_button("back", "↩️ Back"),
+                    callback_data="currency_back",
+                )
+            ]
+        ],
+    )
+
+
+def cancel_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    get_button("cancel", "❌ Cancel"),
+                    callback_data="home",
+                )
+            ]
+        ]
+    )
+
+
+# ============================================================
+# ADMIN KEYBOARDS
+# ============================================================
+
+def admin_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📦 Products", callback_data="admin_products"),
+                InlineKeyboardButton("🗂️ Categories", callback_data="admin_categories"),
+            ],
+            [
+                InlineKeyboardButton("💱 Currencies", callback_data="admin_currencies"),
+                InlineKeyboardButton("💰 Prices", callback_data="admin_prices"),
+            ],
+            [
+                InlineKeyboardButton("📝 Texts / Steps", callback_data="admin_texts"),
+                InlineKeyboardButton("🔘 Buttons", callback_data="admin_buttons"),
+            ],
+            [
+                InlineKeyboardButton("🏪 Shop Settings", callback_data="admin_settings"),
+                InlineKeyboardButton("👮 Admins", callback_data="admin_admins"),
+            ],
+            [
+                InlineKeyboardButton("📋 Orders", callback_data="admin_orders"),
+            ],
+            [
+                InlineKeyboardButton("🏠 Shop Preview", callback_data="home"),
+            ],
+        ]
+    )
+
+
+def back_to_admin():
+    return [
+        [
+            InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")
+        ]
+    ]
+
+
+# ============================================================
+# START / ADMIN
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await clear_user_message(update)
+    sessions.pop(user_id, None)
+
+    # /start is sent by the user; remember that command message may have
+    # failed deletion and ignore the failure.
+    await remember_screen(
+        context.bot,
+        update.effective_chat.id,
+        user_id,
+        render_text("welcome"),
+        main_keyboard(),
+    )
+
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user):
+        await clear_user_message(update)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            update.effective_user.id,
+            "⛔ <b>ACCESS DENIED</b>",
+        )
         return
-    if currency_id is None:
-        session = sessions.get(query.from_user.id, {})
-        currency_id = session.get("currency_id")
-    products = get_products(category_id, True)
-    if not products:
-        await edit_screen(query, render_text("no_products"), kb([[back_button("exchange")]]))
-        return
-    session = sessions.setdefault(query.from_user.id, {})
-    session["category_id"] = category_id
-    if currency_id:
-        session["currency_id"] = currency_id
+
+    await clear_user_message(update)
+    sessions.pop(update.effective_user.id, None)
+
+    await remember_screen(
+        context.bot,
+        update.effective_chat.id,
+        update.effective_user.id,
+        "⚙️ <b>ADMIN PANEL</b>\n\n"
+        "Everything important can be managed from this menu.\n"
+        "Changes are saved instantly and used immediately by the shop.",
+        admin_keyboard(),
+    )
+
+
+# ============================================================
+# CUSTOMER SCREENS
+# ============================================================
+
+async def show_exchange(query):
     await edit_screen(
         query,
-        render_text("product", category=category["name"]),
-        product_keyboard(category_id, currency_id),
+        query.from_user.id,
+        render_text("category"),
+        category_keyboard(),
     )
 
 
 async def show_how(query):
     await edit_screen(
         query,
+        query.from_user.id,
         render_text("how"),
-        kb([
-            [InlineKeyboardButton(get_button("exchange", "💱 Exchange"), callback_data="exchange")],
-            [back_button("home")],
-        ]),
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        get_button("exchange", "💱 Exchange"),
+                        callback_data="exchange",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        get_button("back", "↩️ Back"),
+                        callback_data="home",
+                    )
+                ],
+            ]
+        ),
     )
 
 
-# ============================================================
-# ADMIN PANEL KEYBOARDS / SCREENS
-# ============================================================
+async def show_categories(query):
+    categories = get_categories(True)
+    if not categories:
+        await edit_screen(
+            query,
+            query.from_user.id,
+            render_text("no_categories"),
+            InlineKeyboardMarkup(back_to_admin() if is_admin(query.from_user) else [
+                [
+                    InlineKeyboardButton(
+                        get_button("home", "🏠 Main Menu"),
+                        callback_data="home",
+                    )
+                ]
+            ]),
+        )
+        return
 
-
-def admin_keyboard():
-    return kb([
-        [InlineKeyboardButton("📊 Dashboard", callback_data="a:dashboard"), InlineKeyboardButton("🔄 Refresh", callback_data="admin")],
-        [InlineKeyboardButton(get_button("categories", "🗂️ Categories"), callback_data="a:cats")],
-        [InlineKeyboardButton(get_button("products", "📦 Products"), callback_data="a:products")],
-        [InlineKeyboardButton(get_button("currencies", "💱 Currencies"), callback_data="a:currencies"), InlineKeyboardButton(get_button("prices", "💰 Prices"), callback_data="a:prices")],
-        [InlineKeyboardButton(get_button("texts", "📝 Texts"), callback_data="a:texts"), InlineKeyboardButton(get_button("buttons", "🔘 Buttons"), callback_data="a:buttons")],
-        [InlineKeyboardButton(get_button("emojis", "✨ Custom Emojis"), callback_data="a:emojis")],
-        [InlineKeyboardButton("💾 Backup & Restore", callback_data="a:backup"), InlineKeyboardButton("🧰 Miscellaneous", callback_data="a:misc")],
-        [InlineKeyboardButton(get_button("settings", "🏪 Shop Settings"), callback_data="a:settings"), InlineKeyboardButton(get_button("admins", "👮 Admins"), callback_data="a:admins")],
-        [InlineKeyboardButton(get_button("orders", "📋 Orders"), callback_data="a:orders"), InlineKeyboardButton(get_button("users", "👥 Users"), callback_data="a:users")],
-        [InlineKeyboardButton(get_button("home", "🏠 Main Menu"), callback_data="home")],
-    ])
-
-
-def admin_categories_keyboard(parent_id=None):
-    children = get_categories(parent_id, False)
-    rows = [[InlineKeyboardButton(
-        f"{'🟢' if c['enabled'] else '🔴'} {c['button_text']}",
-        callback_data=f"acat:{c['id']}"
-    )] for c in children]
-    rows.append([InlineKeyboardButton("➕ Add Category Here", callback_data=f"acat_add:{parent_id if parent_id is not None else 'root'}")])
-    if parent_id is None:
-        rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
-    else:
-        parent = get_category(parent_id)
-        back = parent["parent_id"] if parent else None
-        rows.append([InlineKeyboardButton("↩️ Parent Category", callback_data=f"acats:{back if back is not None else 'root'}")])
-    return kb(rows)
-
-
-def category_edit_keyboard(category_id):
-    category = get_category(category_id)
-    parent = category["parent_id"] if category else None
-    return kb([
-        [InlineKeyboardButton("🔤 Rename", callback_data=f"cedit_name:{category_id}"),
-         InlineKeyboardButton("🔘 Button", callback_data=f"cedit_button:{category_id}")],
-        [InlineKeyboardButton("📝 Description", callback_data=f"cedit_desc:{category_id}"),
-         InlineKeyboardButton("📁 Add Subcategory", callback_data=f"acat_add:{category_id}")],
-        [InlineKeyboardButton("↪️ Move", callback_data=f"cedit_move:{category_id}"),
-         InlineKeyboardButton("↕️ Reorder", callback_data=f"cedit_order:{category_id}")],
-        [InlineKeyboardButton("🟢 / 🔴 Enable", callback_data=f"ctoggle:{category_id}"),
-         InlineKeyboardButton("🗑️ Delete", callback_data=f"cdelete:{category_id}")],
-        [InlineKeyboardButton("📂 Open", callback_data=f"acats:{category_id}")],
-        [InlineKeyboardButton("↩️ Categories", callback_data=f"acats:{parent if parent is not None else 'root'}")],
-    ])
-
-
-def admin_products_keyboard():
-    rows = [[InlineKeyboardButton("➕ Add Product", callback_data="apickcat")]]
-    for p in get_all_products():
-        cat = get_category(p["category_id"])
-        location = cat["name"] if cat else "No category"
-        status = "🟢" if p["enabled"] else "🔴"
-        custom = " ✏️" if p["is_custom"] else ""
-        rows.append([InlineKeyboardButton(
-            f"{status} {p['button_text']} · {location}{custom}",
-            callback_data=f"a_product:{p['id']}"
-        )])
-    rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
-    return kb(rows)
-
-
-def product_edit_keyboard(product_id):
-    return kb([
-        [InlineKeyboardButton("🔤 Name", callback_data=f"p_name:{product_id}"),
-         InlineKeyboardButton("🔘 Button", callback_data=f"p_button:{product_id}")],
-        [InlineKeyboardButton("🔢 Amount", callback_data=f"p_amount:{product_id}"),
-         InlineKeyboardButton("💰 Prices", callback_data=f"p_prices:{product_id}")],
-        [InlineKeyboardButton("📝 Description", callback_data=f"p_desc:{product_id}"),
-         InlineKeyboardButton("📂 Move", callback_data=f"p_move:{product_id}")],
-        [InlineKeyboardButton("📋 Duplicate", callback_data=f"p_duplicate:{product_id}")],
-        [InlineKeyboardButton("🟢 / 🔴 Enable", callback_data=f"ptoggle:{product_id}"),
-         InlineKeyboardButton("🗑️ Delete", callback_data=f"pdelete:{product_id}")],
-        [InlineKeyboardButton("↕️ Reorder", callback_data=f"p_order:{product_id}")],
-        [InlineKeyboardButton("↩️ Products", callback_data="a:products")],
-    ])
-
-
-def admin_currency_keyboard():
-    rows = [[InlineKeyboardButton("➕ Add Currency", callback_data="curadd")]]
-    for c in get_currencies(False):
-        rows.append([InlineKeyboardButton(
-            f"{'🟢' if c['enabled'] else '🔴'} {c['button_text']}",
-            callback_data=f"cedit:{c['id']}"
-        )])
-    rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
-    return kb(rows)
-
-
-def currency_edit_keyboard(currency_id):
-    return kb([
-        [InlineKeyboardButton("🔤 Name", callback_data=f"c_name:{currency_id}"),
-         InlineKeyboardButton("🔘 Button", callback_data=f"c_button:{currency_id}")],
-        [InlineKeyboardButton("🟢 / 🔴 Enable", callback_data=f"ctogglecur:{currency_id}"),
-         InlineKeyboardButton("🗑️ Delete", callback_data=f"cdeletecur:{currency_id}")],
-        [InlineKeyboardButton("↕️ Reorder", callback_data=f"corder:{currency_id}")],
-        [InlineKeyboardButton("↩️ Currencies", callback_data="a:currencies")],
-    ])
-
-
-def admin_prices_keyboard():
-    rows = []
-    for c in get_currencies(False):
-        rows.append([InlineKeyboardButton(
-            f"💰 {c['name']}", callback_data=f"pricecur:{c['id']}")])
-    rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
-    return kb(rows)
-
-
-def admin_texts_keyboard():
-    rows = [[InlineKeyboardButton(text_label(k), callback_data=f"text:{k}")] for k in TEXT_LABELS]
-    rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
-    return kb(rows)
-
-
-def admin_buttons_keyboard():
-    rows = [[InlineKeyboardButton(
-        f"{BUTTON_LABELS.get(k,k)}: {get_button(k)}",
-        callback_data=f"button:{k}")
-    ] for k in DEFAULT_BUTTONS]
-    rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
-    return kb(rows)
-
-
-def settings_keyboard():
-    return kb([
-        [InlineKeyboardButton("🏷️ Shop Name", callback_data="set:shop_name")],
-        [InlineKeyboardButton("👤 Support Username", callback_data="set:admin_username")],
-        [InlineKeyboardButton("🆔 Order Recipient Chat ID", callback_data="set:recipient")],
-        [InlineKeyboardButton("🔢 Max Custom Amount", callback_data="set:max_amount")],
-        [InlineKeyboardButton(
-            f"🧹 User message cleanup: {'ON' if get_setting('delete_user_messages','0')=='1' else 'OFF'}",
-            callback_data="toggle:cleanup",
-        )],
-        [InlineKeyboardButton(
-            f"⚙️ Admin button in shop: {'ON' if get_setting('show_admin_button','1')=='1' else 'OFF'}",
-            callback_data="toggle:admin_button",
-        )],
-        [InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")],
-    ])
-
-
-def admin_orders_keyboard():
-    rows = []
-    for o in get_orders(30):
-        icon = "⏳" if o["status"] == "awaiting_confirmation" else "✅" if o["status"] == "confirmed" else "❌"
-        rows.append([InlineKeyboardButton(
-            f"{icon} {o['order_number']} · {o['roblox_username']}",
-            callback_data=f"order:{o['order_number']}")])
-    rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
-    return kb(rows)
-
-
-def admin_emoji_keyboard():
-    rows = [[InlineKeyboardButton("➕ Add Custom Emoji", callback_data="emoji_add")]]
-    for e in get_emojis(False):
-        status = "🟢" if e["enabled"] else "🔴"
-        rows.append([InlineKeyboardButton(
-            f"{status} {e['fallback']} {e['name']}",
-            callback_data=f"emoji:{e['id']}")])
-    rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
-    return kb(rows)
-
-
-def emoji_edit_keyboard(emoji_id):
-    return kb([
-        [InlineKeyboardButton("🔤 Rename", callback_data=f"emoji_name:{emoji_id}")],
-        [InlineKeyboardButton("🟢 / 🔴 Enable", callback_data=f"emoji_toggle:{emoji_id}"),
-         InlineKeyboardButton("🗑️ Delete", callback_data=f"emoji_delete:{emoji_id}")],
-        [InlineKeyboardButton("↩️ Emojis", callback_data="a:emojis")],
-    ])
-
-
-def admins_keyboard():
-    rows = [[InlineKeyboardButton("➕ Add Admin", callback_data="adminadd")]]
-    for a in get_admins():
-        rows.append([InlineKeyboardButton(
-            f"👮 {a['label'] or a['telegram_id']} · {a['telegram_id']}",
-            callback_data=f"adminremove:{a['telegram_id']}")])
-    rows.append([InlineKeyboardButton(get_button("admin", "⚙️ Admin Panel"), callback_data="admin")])
-    return kb(rows)
-
-
-# ============================================================
-# ADMIN SCREEN RENDERERS
-# ============================================================
-
-
-async def show_admin(query):
     await edit_screen(
         query,
-        "⚙️ <b>ADMIN PANEL</b>\n\n"
-        "Your entire shop can be managed from Telegram.\n"
-        "Changes are saved immediately.",
-        admin_keyboard(),
+        query.from_user.id,
+        render_text("category"),
+        category_keyboard(),
     )
 
 
-async def show_admin_categories(query, parent_id=None):
-    if parent_id == "root":
-        parent_id = None
-    title = "ROOT CATEGORIES" if parent_id is None else current_category_path(parent_id)
-    children = get_categories(parent_id, False)
-    body = (
-        "Tap a category to edit it or open it.\n"
-        "Categories can contain unlimited subcategories.\n\n"
-        f"Current location: <b>{esc(title)}</b>"
+async def show_currency_step(query, category_id):
+    category = get_category(category_id)
+
+    if (
+        not category
+        or not category["enabled"]
+        or not category["visibility"]
+    ):
+        await query.answer(
+            "This category is not currently public.",
+            show_alert=True,
+        )
+        return
+
+    products = get_products(category_id, True)
+    if not products:
+        await edit_screen(
+            query,
+            query.from_user.id,
+            render_text(
+                "no_products",
+            ),
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            get_button("back", "↩️ Back"),
+                            callback_data="exchange",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+
+    session_for(query.from_user.id).update(
+        {
+            "category_id": category_id,
+            "category_name": category["name"],
+            "waiting": "currency",
+        }
     )
-    if not children:
-        body += "\n\nNo categories here yet."
-    await edit_screen(query, "🗂️ <b>CATEGORIES</b>\n\n" + body, admin_categories_keyboard(parent_id))
+
+    extra = "\n\n" + clean(category["description"]) if category["description"] else ""
+    text = render_text("currency") + extra
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        text,
+        currency_keyboard(),
+    )
 
 
-async def show_category_edit(query, category_id):
-    c = get_category(category_id)
-    if not c:
+async def show_products_step(query, currency_id):
+    session = sessions.get(query.from_user.id, {})
+    category_id = session.get("category_id")
+    currency = get_currency(currency_id)
+
+    if not category_id or not currency or not currency["enabled"]:
+        await query.answer(
+            "Please start the order again.",
+            show_alert=True,
+        )
+        return
+
+    products = get_products(category_id, True)
+    if not products:
+        await edit_screen(
+            query,
+            query.from_user.id,
+            render_text("no_products"),
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            get_button("back", "↩️ Back"),
+                            callback_data="exchange",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+
+    session.update(
+        {
+            "currency_id": currency_id,
+            "currency_name": currency["name"],
+            "waiting": "product",
+        }
+    )
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        render_text("product"),
+        product_keyboard(category_id, currency_id),
+    )
+
+
+# ============================================================
+# ADMIN: CATEGORIES
+# ============================================================
+
+async def show_admin_categories(query):
+    rows = [
+        [
+            InlineKeyboardButton(
+                "➕ Add Category",
+                callback_data="add_category",
+            )
+        ]
+    ]
+
+    categories = get_categories(False)
+    if categories:
+        for category in categories:
+            status = "🟢" if category["enabled"] else "🔴"
+            visibility = "🌐" if category["visibility"] else "🔒"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{status} {visibility} {category['button_text']}",
+                        callback_data=f"edit_category:{category['id']}",
+                    )
+                ]
+            )
+    else:
+        rows.append(
+            [InlineKeyboardButton("No categories yet", callback_data="noop")]
+        )
+
+    rows.extend(back_to_admin())
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        "🗂️ <b>CATEGORIES</b>\n\n"
+        "Create unlimited categories and put products inside them.\n\n"
+        "🌐 Public = customers can see it\n"
+        "🔒 Private = admins only",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+def category_admin_keyboard(category_id):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔤 Edit Name",
+                    callback_data=f"rename_category:{category_id}",
+                ),
+                InlineKeyboardButton(
+                    "🔘 Edit Button",
+                    callback_data=f"category_button:{category_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "📝 Edit Description",
+                    callback_data=f"category_desc:{category_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "📦 Manage Products",
+                    callback_data=f"category_products:{category_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🟢 / 🔴 Enable / Disable",
+                    callback_data=f"toggle_category:{category_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🌐 / 🔒 Public / Private",
+                    callback_data=f"toggle_category_visibility:{category_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬆️ Up",
+                    callback_data=f"category_up:{category_id}",
+                ),
+                InlineKeyboardButton(
+                    "⬇️ Down",
+                    callback_data=f"category_down:{category_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗑️ Delete Category",
+                    callback_data=f"delete_category:{category_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "↩️ Categories",
+                    callback_data="admin_categories",
+                )
+            ],
+        ]
+    )
+
+
+async def show_edit_category(query, category_id):
+    category = get_category(category_id)
+    if not category:
         await query.answer("Category not found.", show_alert=True)
         return
-    children = get_category_children(category_id, False)
+
     products = get_products(category_id, False)
+    status = "🟢 Enabled" if category["enabled"] else "🔴 Disabled"
+    visibility = "🌐 Public" if category["visibility"] else "🔒 Private"
+
     await edit_screen(
         query,
+        query.from_user.id,
         "🗂️ <b>EDIT CATEGORY</b>\n\n"
-        f"🏷️ Name: <b>{esc(c['name'])}</b>\n"
-        f"🔘 Button: <b>{esc(c['button_text'])}</b>\n"
-        f"📝 Description: <b>{esc(c['description'] or '—')}</b>\n"
-        f"📂 Subcategories: <b>{len(children)}</b>\n"
+        f"🏷️ Name: <b>{clean(category['name'])}</b>\n"
+        f"🔘 Button: <b>{clean(category['button_text'])}</b>\n"
         f"📦 Products: <b>{len(products)}</b>\n"
-        f"📌 Status: <b>{'Enabled' if c['enabled'] else 'Disabled'}</b>",
-        category_edit_keyboard(category_id),
+        f"📌 Status: <b>{status}</b>\n"
+        f"👁️ Visibility: <b>{visibility}</b>",
+        category_admin_keyboard(category_id),
     )
 
+
+async def category_product_list(query, category_id):
+    category = get_category(category_id)
+    if not category:
+        await query.answer("Category not found.", show_alert=True)
+        return
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                "➕ Add Product",
+                callback_data=f"add_product:{category_id}",
+            )
+        ]
+    ]
+
+    products = get_products(category_id, False)
+    for product in products:
+        status = "🟢" if product["enabled"] else "🔴"
+        visibility = "🌐" if product["visibility"] else "🔒"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{status} {visibility} {product['button_text']}",
+                    callback_data=f"edit_product:{product['id']}",
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "↩️ Category",
+                callback_data=f"edit_category:{category_id}",
+            )
+        ]
+    )
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        f"📦 <b>{clean(category['name'])}</b>\n\n"
+        "Manage the products inside this category.",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+# ============================================================
+# ADMIN: PRODUCTS
+# ============================================================
 
 async def show_admin_products(query):
-    products = get_all_products()
-    summary = "\n".join(
-        f"{'🟢' if p['enabled'] else '🔴'} {esc(p['button_text'])} — {p['amount']:,} Robux"
-        for p in products[:20]
-    ) or "No products yet."
-    await edit_screen(query, "📦 <b>PRODUCTS</b>\n\nTap a product to edit it.\n\n" + summary, admin_products_keyboard())
+    rows = []
+    categories = get_categories(False)
+
+    for category in categories:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🗂️ {category['name']}",
+                    callback_data=f"category_products:{category['id']}",
+                )
+            ]
+        )
+
+    rows.extend(back_to_admin())
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        "📦 <b>PRODUCTS</b>\n\n"
+        "Choose a category to add, edit, disable or remove products.\n\n"
+        "🌐 Public = customers can see it\n"
+        "🔒 Private = admins only",
+        InlineKeyboardMarkup(rows),
+    )
 
 
-async def show_product_edit(query, product_id):
-    p = get_product(product_id)
-    if not p:
+def product_admin_keyboard(product_id):
+    product = get_product(product_id)
+    category_id = product["category_id"] if product else 0
+
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔤 Edit Name",
+                    callback_data=f"rename_product:{product_id}",
+                ),
+                InlineKeyboardButton(
+                    "🔘 Edit Button",
+                    callback_data=f"product_button:{product_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔢 Change Amount",
+                    callback_data=f"amount_product:{product_id}",
+                ),
+                InlineKeyboardButton(
+                    "📝 Edit Description",
+                    callback_data=f"product_desc:{product_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗂️ Move Category",
+                    callback_data=f"move_product:{product_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "💰 Edit Prices",
+                    callback_data=f"product_prices:{product_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🟢 / 🔴 Enable / Disable",
+                    callback_data=f"toggle_product:{product_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🌐 / 🔒 Public / Private",
+                    callback_data=f"toggle_product_visibility:{product_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬆️ Up",
+                    callback_data=f"product_up:{product_id}",
+                ),
+                InlineKeyboardButton(
+                    "⬇️ Down",
+                    callback_data=f"product_down:{product_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗑️ Delete Product",
+                    callback_data=f"delete_product:{product_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "↩️ Products",
+                    callback_data=(
+                        f"category_products:{category_id}"
+                        if category_id
+                        else "admin_products"
+                    ),
+                )
+            ],
+        ]
+    )
+
+
+async def show_edit_product(query, product_id):
+    product = get_product(product_id)
+    if not product:
         await query.answer("Product not found.", show_alert=True)
         return
-    c = get_category(p["category_id"])
-    location = current_category_path(c["id"]) if c else "No category"
-    kind = "Custom amount" if p["is_custom"] else f"{p['amount']:,} Robux"
+
+    category = get_category(product["category_id"]) if product["category_id"] else None
+    status = "🟢 Enabled" if product["enabled"] else "🔴 Disabled"
+    visibility = "🌐 Public" if product["visibility"] else "🔒 Private"
+
     await edit_screen(
         query,
+        query.from_user.id,
         "📦 <b>EDIT PRODUCT</b>\n\n"
-        f"🏷️ Name: <b>{esc(p['name'])}</b>\n"
-        f"🔘 Button: <b>{esc(p['button_text'])}</b>\n"
-        f"🔢 Type: <b>{kind}</b>\n"
-        f"📝 Description: <b>{esc(p['description'] or '—')}</b>\n"
-        f"📂 Category: <b>{esc(location)}</b>\n"
-        f"📌 Status: <b>{'Enabled' if p['enabled'] else 'Disabled'}</b>",
-        product_edit_keyboard(product_id),
+        f"🏷️ Name: <b>{clean(product['name'])}</b>\n"
+        f"🔘 Button: <b>{clean(product['button_text'])}</b>\n"
+        f"🔢 Amount: <b>{product['amount']:,} Robux</b>\n"
+        f"🗂️ Category: <b>{clean(category['name']) if category else 'None'}</b>\n"
+        f"📌 Status: <b>{status}</b>\n"
+        f"👁️ Visibility: <b>{visibility}</b>",
+        product_admin_keyboard(product_id),
     )
 
+
+# ============================================================
+# ADMIN: CURRENCIES
+# ============================================================
 
 async def show_admin_currencies(query):
+    rows = [
+        [
+            InlineKeyboardButton(
+                "➕ Add Payment Method",
+                callback_data="add_currency",
+            )
+        ]
+    ]
+
+    for currency in get_currencies(False):
+        status = "🟢" if currency["enabled"] else "🔴"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{status} {currency['button_text']}",
+                    callback_data=f"edit_currency:{currency['id']}",
+                )
+            ]
+        )
+
+    rows.extend(back_to_admin())
+
     await edit_screen(
         query,
-        "💱 <b>CURRENCIES</b>\n\n"
-        "Add, rename, reorder, enable/disable or delete any payment method.",
-        admin_currency_keyboard(),
+        query.from_user.id,
+        "💱 <b>PAYMENT METHODS</b>\n\n"
+        "Add, rename, reorder, enable or delete payment methods.",
+        InlineKeyboardMarkup(rows),
     )
 
 
-async def show_currency_edit(query, currency_id):
-    c = get_currency(currency_id)
-    if not c:
-        await query.answer("Currency not found.", show_alert=True)
-        return
-    await edit_screen(
-        query,
-        "💱 <b>EDIT CURRENCY</b>\n\n"
-        f"🏷️ Name: <b>{esc(c['name'])}</b>\n"
-        f"🔘 Button: <b>{esc(c['button_text'])}</b>\n"
-        f"📌 Status: <b>{'Enabled' if c['enabled'] else 'Disabled'}</b>",
-        currency_edit_keyboard(currency_id),
+def currency_admin_keyboard(currency_id):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔤 Edit Name",
+                    callback_data=f"rename_currency:{currency_id}",
+                ),
+                InlineKeyboardButton(
+                    "🔘 Edit Button",
+                    callback_data=f"currency_button:{currency_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🟢 / 🔴 Enable / Disable",
+                    callback_data=f"toggle_currency:{currency_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬆️ Up",
+                    callback_data=f"currency_up:{currency_id}",
+                ),
+                InlineKeyboardButton(
+                    "⬇️ Down",
+                    callback_data=f"currency_down:{currency_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "💰 Edit Prices",
+                    callback_data=f"prices_currency:{currency_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🗑️ Delete Payment Method",
+                    callback_data=f"delete_currency:{currency_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "↩️ Payment Methods",
+                    callback_data="admin_currencies",
+                )
+            ],
+        ]
     )
 
 
-async def show_price_currency(query, currency_id):
-    c = get_currency(currency_id)
-    if not c:
-        await query.answer("Currency not found.", show_alert=True)
+async def show_edit_currency(query, currency_id):
+    currency = get_currency(currency_id)
+    if not currency:
+        await query.answer("Payment method not found.", show_alert=True)
         return
+
+    status = "🟢 Enabled" if currency["enabled"] else "🔴 Disabled"
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        "💱 <b>EDIT PAYMENT METHOD</b>\n\n"
+        f"🏷️ Name: <b>{clean(currency['name'])}</b>\n"
+        f"🔘 Button: <b>{clean(currency['button_text'])}</b>\n"
+        f"📌 Status: <b>{status}</b>",
+        currency_admin_keyboard(currency_id),
+    )
+
+
+# ============================================================
+# ADMIN: PRICES
+# ============================================================
+
+async def show_admin_prices(query):
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"💰 {currency['name']}",
+                callback_data=f"prices_currency:{currency['id']}",
+            )
+        ]
+        for currency in get_currencies(False)
+    ]
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "↩️ Admin Panel",
+                callback_data="admin",
+            )
+        ]
+    )
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        "💰 <b>PRICE MANAGEMENT</b>\n\n"
+        "Prices are linked to payment methods and products.\n"
+        "Change a price once and the customer flow updates immediately.",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def show_currency_prices(query, currency_id):
+    currency = get_currency(currency_id)
+    if not currency:
+        await query.answer("Payment method not found.", show_alert=True)
+        return
+
     rows = []
-    for p in get_all_products():
-        price = get_price(currency_id, p["id"])
-        rows.append([InlineKeyboardButton(
-            f"{p['button_text']} → {price}",
-            callback_data=f"setprice:{currency_id}:{p['id']}")])
-    rows.append([InlineKeyboardButton(
-        f"✏️ Custom Amount Price → {get_custom_price(currency_id)}",
-        callback_data=f"setcustomprice:{currency_id}")])
-    rows.append([InlineKeyboardButton("↩️ Prices", callback_data="a:prices")])
-    await edit_screen(query, f"💰 <b>{esc(c['name'])} PRICES</b>\n\nTap a price to change it.", kb(rows))
+    for product in get_products(None, False):
+        price = get_price(currency_id, product["id"])
+        category = (
+            get_category(product["category_id"])
+            if product["category_id"]
+            else None
+        )
+        prefix = f"{category['name']} · " if category else ""
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{prefix}{product['button_text']} → {price}",
+                    callback_data=f"set_price:{currency_id}:{product['id']}",
+                )
+            ]
+        )
+
+    custom = get_custom_price(currency_id)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"✏️ Custom Amount → {custom}",
+                callback_data=f"set_custom:{currency_id}",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "↩️ Payment Methods",
+                callback_data="admin_currencies",
+            )
+        ]
+    )
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        f"💰 <b>PRICES · {clean(currency['name'])}</b>\n\n"
+        "Tap any price to change it.",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def show_product_prices(query, product_id):
+    product = get_product(product_id)
+    if not product:
+        await query.answer("Product not found.", show_alert=True)
+        return
+
+    rows = []
+    for currency in get_currencies(False):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{currency['name']} → {get_price(currency['id'], product_id)}",
+                    callback_data=f"set_price:{currency['id']}:{product_id}",
+                )
+            ]
+        )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "↩️ Product",
+                callback_data=f"edit_product:{product_id}",
+            )
+        ]
+    )
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        f"💰 <b>PRICES · {clean(product['button_text'])}</b>\n\n"
+        "Choose a payment method to edit its price.",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+# ============================================================
+# ADMIN: TEXTS / BUTTONS / SETTINGS
+# ============================================================
+
+TEXT_NAMES = {
+    "welcome": "👋 Welcome",
+    "category": "🗂️ Category Step",
+    "currency": "💱 Payment Method Step",
+    "product": "📦 Product Step",
+    "custom": "✏️ Custom Amount Step",
+    "username": "👤 Roblox Username Step",
+    "how": "ℹ️ How It Works",
+    "confirmation": "✅ Order Sent / Confirmation",
+    "cancelled": "❌ Cancelled",
+    "no_categories": "🗂️ No Categories",
+    "no_products": "📦 No Products",
+    "invalid_amount": "⚠️ Invalid Amount",
+    "invalid_username": "⚠️ Invalid Username",
+    "order_error": "⚠️ Order Error",
+    "no_session": "ℹ️ No Session",
+    "admin_new_order": "🔔 Admin New Order",
+    "admin_no_recipient": "⚠️ Admin Notification Error",
+}
+
+BUTTON_NAMES = {
+    "exchange": "💱 Exchange",
+    "how": "ℹ️ How It Works",
+    "custom": "✏️ Custom Amount",
+    "back": "↩️ Back",
+    "home": "🏠 Main Menu",
+    "new_order": "💱 New Order",
+    "cancel": "❌ Cancel",
+    "categories": "🗂️ Categories",
+}
 
 
 async def show_texts(query):
-    await edit_screen(query, "📝 <b>TEXT EDITOR</b>\n\nTap any message to replace it. HTML formatting is supported.\n\nCustom emoji syntax: <code>{{emoji:name}}</code>", admin_texts_keyboard())
+    rows = []
+    for key, label in TEXT_NAMES.items():
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=f"edit_text:{key}",
+                )
+            ]
+        )
+
+    rows.extend(back_to_admin())
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        "📝 <b>TEXTS / STEPS</b>\n\n"
+        "Every customer and admin message is editable here.\n\n"
+        "Use the documented placeholders shown before editing.",
+        InlineKeyboardMarkup(rows),
+    )
 
 
 async def show_buttons(query):
-    await edit_screen(query, "🔘 <b>BUTTON EDITOR</b>\n\nTap any button label to replace it.", admin_buttons_keyboard())
+    rows = []
+    for key, label in BUTTON_NAMES.items():
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{label}: {get_button(key)}",
+                    callback_data=f"edit_button:{key}",
+                )
+            ]
+        )
+
+    rows.extend(back_to_admin())
+
+    await edit_screen(
+        query,
+        query.from_user.id,
+        "🔘 <b>BUTTON EDITOR</b>\n\n"
+        "Rename the labels without touching the code.",
+        InlineKeyboardMarkup(rows),
+    )
 
 
 async def show_settings(query):
-    recipient = get_setting("order_recipient_chat_id", "") or "Not configured"
     await edit_screen(
         query,
+        query.from_user.id,
         "🏪 <b>SHOP SETTINGS</b>\n\n"
-        f"🏷️ Shop name: <b>{esc(get_setting('shop_name'))}</b>\n"
-        f"👤 Support username: <b>{esc(get_setting('admin_username'))}</b>\n"
-        f"🆔 Order recipient: <code>{esc(recipient)}</code>\n"
-        f"🔢 Max custom amount: <b>{esc(get_setting('max_custom_amount'))}</b>\n"
-        f"🧹 Delete user messages: <b>{'ON' if get_setting('delete_user_messages','0')=='1' else 'OFF'}</b>\n"
-        f"⚙️ Admin button in shop: <b>{'ON' if get_setting('show_admin_button','1')=='1' else 'OFF'}</b>",
-        settings_keyboard(),
+        f"🏷️ Shop name: <b>{clean(get_setting('shop_name'))}</b>\n"
+        f"👤 Support username: <b>{clean(get_setting('admin_username'))}</b>\n"
+        f"🆔 Order recipient: <code>{clean(get_setting('order_recipient_chat_id') or 'not set')}</code>\n"
+        f"🔢 Max custom amount: <b>{clean(get_setting('max_custom_amount', '1000000'))}</b>\n"
+        f"🧹 Delete user messages: <b>{'ON' if get_setting('delete_user_messages', '1') == '1' else 'OFF'}</b>\n",
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🏷️ Shop Name",
+                        callback_data="change_shop_name",
+                    ),
+                    InlineKeyboardButton(
+                        "👤 Support Username",
+                        callback_data="change_admin_username",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🆔 Order Recipient",
+                        callback_data="change_recipient",
+                    ),
+                    InlineKeyboardButton(
+                        "🔢 Custom Amount Limit",
+                        callback_data="change_max_amount",
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🧹 Toggle Chat Cleanup",
+                        callback_data="toggle_cleanup",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "↩️ Admin Panel",
+                        callback_data="admin",
+                    )
+                ],
+            ]
+        ),
     )
-
-
-async def show_orders(query):
-    await edit_screen(query, "📋 <b>RECENT ORDERS</b>\n\nTap an order to view details and change its status.", admin_orders_keyboard())
-
-
-async def show_emojis(query):
-    await edit_screen(
-        query,
-        "✨ <b>CUSTOM EMOJIS</b>\n\n"
-        "Add a Telegram custom emoji by sending it when prompted.\n\n"
-        "Use saved emojis inside any editable text with:\n"
-        "<code>{{emoji:name}}</code>",
-        admin_emoji_keyboard(),
-    )
-
-
-async def show_emoji_edit(query, emoji_id):
-    e = get_emoji(emoji_id)
-    if not e:
-        await query.answer("Emoji not found.", show_alert=True)
-        return
-    await edit_screen(
-        query,
-        "✨ <b>EDIT CUSTOM EMOJI</b>\n\n"
-        f"🏷️ Name: <b>{esc(e['name'])}</b>\n"
-        f"👀 Preview: {e['fallback']}\n"
-        f"🆔 Telegram emoji ID: <code>{esc(e['emoji_id'])}</code>\n"
-        f"📌 Status: <b>{'Enabled' if e['enabled'] else 'Disabled'}</b>\n\n"
-        f"Token: <code>{{{{emoji:{esc(e['name'])}}}}}</code>",
-        emoji_edit_keyboard(emoji_id),
-    )
-
-
-async def show_dashboard(query):
-    conn = db()
-    stats = {
-        "categories": conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0],
-        "products": conn.execute("SELECT COUNT(*) FROM products").fetchone()[0],
-        "currencies": conn.execute("SELECT COUNT(*) FROM currencies").fetchone()[0],
-        "orders": conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
-        "pending": conn.execute("SELECT COUNT(*) FROM orders WHERE status='awaiting_confirmation'").fetchone()[0],
-        "confirmed": conn.execute("SELECT COUNT(*) FROM orders WHERE status='confirmed'").fetchone()[0],
-        "rejected": conn.execute("SELECT COUNT(*) FROM orders WHERE status='rejected'").fetchone()[0],
-        "emojis": conn.execute("SELECT COUNT(*) FROM custom_emojis").fetchone()[0],
-    }
-    conn.close()
-    await edit_screen(query, "📊 <b>DASHBOARD</b>\n\n"
-        f"🗂️ Categories: <b>{stats['categories']}</b>\n"
-        f"📦 Products: <b>{stats['products']}</b>\n"
-        f"💱 Currencies: <b>{stats['currencies']}</b>\n"
-        f"✨ Custom emojis: <b>{stats['emojis']}</b>\n\n"
-        f"📋 Orders: <b>{stats['orders']}</b>\n"
-        f"⏳ Pending: <b>{stats['pending']}</b>\n"
-        f"✅ Confirmed: <b>{stats['confirmed']}</b>\n"
-        f"❌ Rejected: <b>{stats['rejected']}</b>\n\n"
-        f"💾 Embedded backup: <b>{'available' if EMBEDDED_BACKUP.strip() else 'not set'}</b>",
-        kb([[InlineKeyboardButton("💾 Backup & Restore", callback_data="a:backup")], [InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]))
-
-
-def misc_keyboard():
-    def state(key): return "ON" if get_setting(key, "0") == "1" else "OFF"
-    return kb([
-        [InlineKeyboardButton(f"🛠️ Maintenance Mode: {state('maintenance_mode')}", callback_data="misc:maintenance")],
-        [InlineKeyboardButton(f"💰 Show Prices on Product Buttons: {state('show_product_prices')}", callback_data="misc:show_prices")],
-        [InlineKeyboardButton(f"📋 Customer Order History: {state('customer_order_history')}", callback_data="misc:history")],
-        [InlineKeyboardButton(f"🛡️ Anti-Spam Protection: {state('anti_spam')}", callback_data="misc:anti_spam")],
-        [InlineKeyboardButton(f"⏱️ Anti-Spam Delay: {get_setting('anti_spam_seconds','2')}s", callback_data="misc:set_delay")],
-        [InlineKeyboardButton(f"🐞 Debug Logging: {state('debug_mode')}", callback_data="misc:debug")],
-        [InlineKeyboardButton("↩️ Admin Panel", callback_data="admin")],
-    ])
-
-
-async def show_misc(query):
-    await edit_screen(query, "🧰 <b>MISCELLANEOUS</b>\n\n"
-        "Every optional feature here starts <b>OFF</b>.\n\n"
-        "🛠️ Maintenance temporarily blocks customer exchanges.\n"
-        "💰 Price previews show prices on product buttons.\n"
-        "📋 Order history adds a customer-only history button.\n"
-        "🛡️ Anti-spam adds a callback cooldown.\n"
-        "🐞 Debug logging increases local logs for troubleshooting.", misc_keyboard())
-
-
-async def show_backup(query):
-    await edit_screen(query, "💾 <b>BACKUP & RESTORE</b>\n\n" + backup_summary() + "\n\n"
-        "📥 Import a previous backup (file or pasted string).\n"
-        "📤 Download the current portable backup.\n"
-        "📦 Download a fresh Python script with the current backup embedded.\n\n"
-        "A brand-new database automatically restores EMBEDDED_BACKUP.", kb([
-            [InlineKeyboardButton("📥 Import Backup", callback_data="backup:import")],
-            [InlineKeyboardButton("📤 Download Current Backup", callback_data="backup:download")],
-            [InlineKeyboardButton("📦 Download Updated Script", callback_data="backup:script")],
-            [InlineKeyboardButton("🔍 Backup Summary", callback_data="backup:summary")],
-            [InlineKeyboardButton("↩️ Admin Panel", callback_data="admin")],
-        ]))
-
-
-async def show_history(query):
-    if get_setting("customer_order_history", "0") != "1" and not is_admin(query.from_user):
-        await query.answer("Order history is disabled.", show_alert=True)
-        return
-    conn = db()
-    rows = conn.execute("SELECT * FROM orders WHERE telegram_id=? ORDER BY id DESC LIMIT 10", (query.from_user.id,)).fetchall()
-    conn.close()
-    if not rows:
-        body = "📋 <b>YOUR ORDERS</b>\n\nNo orders yet."
-    else:
-        lines = [render_text("history"), ""]
-        for o in rows:
-            icon = "⏳" if o["status"] == "awaiting_confirmation" else "✅" if o["status"] == "confirmed" else "❌"
-            lines.append(f"{icon} <b>{esc(o['order_number'])}</b> · {o['robux_amount']:,} Robux · {esc(o['currency'])}\n   👤 {esc(o['roblox_username'])} · {esc(o['created_at'])}")
-        body = "\n".join(lines)
-    await edit_screen(query, body, kb([[back_button("home")]]))
 
 
 async def show_admins(query):
+    admins = get_admins()
+    rows = [
+        [
+            InlineKeyboardButton(
+                "➕ Add Admin",
+                callback_data="add_admin",
+            )
+        ]
+    ]
+
+    for admin_row in admins:
+        label = admin_row["label"] or str(admin_row["telegram_id"])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"👮 {label} · {admin_row['telegram_id']}",
+                    callback_data=f"remove_admin_confirm:{admin_row['telegram_id']}",
+                )
+            ]
+        )
+
+    rows.extend(back_to_admin())
+
     await edit_screen(
         query,
+        query.from_user.id,
         "👮 <b>ADMINS</b>\n\n"
-        "The bootstrap admin from ADMIN_CHAT_ID cannot be removed from this panel.",
-        admins_keyboard(),
+        "Tap an admin to remove them.\n"
+        "The environment bootstrap admin always keeps access.",
+        InlineKeyboardMarkup(rows),
     )
 
 
 # ============================================================
-# ADMIN INPUT STATE
+# ADMIN INPUT STARTERS
 # ============================================================
 
-
-def start_input(user_id, action, **data):
+def start_admin_action(user_id, action, **data):
     sessions[user_id] = {"action": action, **data}
 
 
-async def ask_input(query, action, prompt, **data):
-    start_input(query.from_user.id, action, **data)
-    await edit_screen(query, prompt, cancel_keyboard())
-
-
-# ============================================================
-# CUSTOMER ORDER CREATION
-# ============================================================
-
-
-def create_order(user, session, roblox_username):
-    category = get_category(session["category_id"])
-    currency = get_currency(session["currency_id"])
-    product = get_product(session["product_id"])
-    if not category or not currency or not product:
-        raise ValueError("Missing order item")
-
-    amount = int(session["amount"])
-    price = session["price"]
-    conn = db()
-    cursor = conn.execute(
-        """
-        INSERT INTO orders(
-            order_number, telegram_id, telegram_username, telegram_name,
-            category, currency, product, robux_amount, price,
-            roblox_username, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_confirmation', ?)
-        """,
-        (
-            "TEMP",
-            user.id,
-            user.username,
-            user.full_name,
-            category["name"],
-            currency["name"],
-            product["name"],
-            amount,
-            price,
-            roblox_username,
-            now_string(),
-        ),
-    )
-    order_id = cursor.lastrowid
-    order_number = f"#{order_id:04d}"
-    conn.execute("UPDATE orders SET order_number=? WHERE id=?", (order_number, order_id))
-    conn.commit()
-    conn.close()
-    return get_order(order_number)
-
-
-# ============================================================
-# /START / ADMIN COMMANDS
-# ============================================================
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    upsert_user(update.effective_user, update.effective_chat.id)
-    await clear_tracked_messages(context.bot, user_id, update.effective_chat.id)
-    sessions.pop(user_id, None)
-    await cleanup_user_message(update)
-    await send_or_edit_screen(
-        update.get_bot(),
-        update.effective_chat.id,
-        user_id,
-        render_text("welcome"),
-        main_keyboard(update.effective_user),
+async def ask_text_input(query, action, prompt, **data):
+    start_admin_action(query.from_user.id, action, **data)
+    await edit_screen(
+        query,
+        query.from_user.id,
+        prompt,
     )
 
 
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    upsert_user(update.effective_user, update.effective_chat.id)
-    if not is_admin(update.effective_user):
-        await cleanup_user_message(update)
-        await send_or_edit_screen(
-            update.get_bot(), update.effective_chat.id, update.effective_user.id,
-            "⛔ <b>ACCESS DENIED</b>",
-            kb([[back_button("home")]]),
-        )
-        return
-    sessions.pop(update.effective_user.id, None)
-    await cleanup_user_message(update)
-    await send_or_edit_screen(
-        update.get_bot(), update.effective_chat.id, update.effective_user.id,
-        "⚙️ <b>ADMIN PANEL</b>\n\nEverything is managed directly from Telegram.",
-        admin_keyboard(),
+async def start_add_category(query):
+    await ask_text_input(
+        query,
+        "add_category_name",
+        "➕ <b>ADD CATEGORY</b>\n\nSend the category name.\n\nExample: <code>Robux</code>\n\n/cancel to stop.",
     )
 
 
-async def show_users(query):
-    users = get_users(30)
-    lines = ["👥 <b>USERS</b>", "", f"Registered users: <b>{get_user_count()}</b>", ""]
-    if not users:
-        lines.append("No users have interacted with the bot yet.")
-    else:
-        for row in users:
-            if row["username"]:
-                display = "@" + row["username"]
-            else:
-                display = ((row["first_name"] or "") + (" " + row["last_name"] if row["last_name"] else "")).strip() or str(row["telegram_id"])
-            lines.append(f"• <b>{esc(display)}</b> · <code>{row['telegram_id']}</code>")
-    await edit_screen(query, "\n".join(lines), kb([[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]))
+async def start_add_product(query, category_id):
+    await ask_text_input(
+        query,
+        "add_product_name",
+        "➕ <b>ADD PRODUCT</b>\n\n"
+        "Send the product name.\n\n"
+        "Example: <code>2,000 Robux</code>",
+        category_id=category_id,
+    )
+
+
+async def start_add_currency(query):
+    await ask_text_input(
+        query,
+        "add_currency_name",
+        "➕ <b>ADD PAYMENT METHOD</b>\n\n"
+        "Send the payment method name.\n\n"
+        "Example: <code>USDT</code>",
+    )
 
 
 # ============================================================
 # CALLBACK HANDLER
 # ============================================================
 
+ADMIN_PREFIXES = (
+    "admin",
+    "add_",
+    "edit_",
+    "rename_",
+    "amount_",
+    "toggle_",
+    "delete_",
+    "product_",
+    "category_",
+    "currency_",
+    "move_",
+    "set_price:",
+    "set_custom:",
+    "prices_currency:",
+    "change_",
+    "remove_admin",
+)
+
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     data = query.data or ""
     user = query.from_user
     user_id = user.id
 
-    # Optional callback cooldown. OFF by default.
-    if get_setting("anti_spam", "0") == "1":
-        now_ts = datetime.now().timestamp()
-        last_ts = screen_messages.get(f"anti:{user_id}", 0)
-        try:
-            cooldown = max(0.5, float(get_setting("anti_spam_seconds", "2")))
-        except (TypeError, ValueError):
-            cooldown = 2.0
-        if now_ts - last_ts < cooldown:
-            await query.answer("Please wait a moment.")
-            return
-        screen_messages[f"anti:{user_id}"] = now_ts
+    # --------------------------------------------------------
+    # CUSTOMER
+    # --------------------------------------------------------
 
-    # Customer navigation.
     if data == "noop":
         return
+
     if data == "home":
-        await show_home_query(query)
+        sessions.pop(user_id, None)
+        await edit_screen(
+            query,
+            user_id,
+            render_text("welcome"),
+            main_keyboard(),
+        )
         return
+
     if data == "exchange":
         sessions.pop(user_id, None)
         await show_exchange(query)
         return
+
     if data == "how":
         await show_how(query)
         return
-    if data == "history":
-        await show_history(query)
-        return
-    if data.startswith("cat:"):
-        await show_category(query, int(data.split(":",1)[1]))
-        return
-    if data.startswith("catback:"):
-        parent = data.split(":",1)[1]
-        await show_category(query, int(parent))
-        return
-    if data.startswith("catprod:"):
-        cid = int(data.split(":",1)[1])
-        session = sessions.setdefault(user_id, {})
-        if not session.get("currency_id"):
-            # Go to currency selection for this category.
-            category = get_category(cid)
-            if category:
-                session["category_id"] = cid
-                await edit_screen(query, render_text("currency"), currency_keyboard(cid))
-            return
-        await show_category_products(query, cid)
-        return
-    if data.startswith("cur:"):
-        _, category_id, currency_id = data.split(":")
-        category_id = int(category_id); currency_id = int(currency_id)
-        currency = get_currency(currency_id)
-        category = get_category(category_id)
-        if not currency or not currency["enabled"] or not category or not category["enabled"]:
-            await query.answer("This option is unavailable.", show_alert=True)
-            return
-        sessions[user_id] = {"category_id": category_id, "currency_id": currency_id, "waiting": "product"}
-        await show_category_products(query, category_id, currency_id)
-        return
-    if data.startswith("curback:"):
-        category_id = int(data.split(":",1)[1])
-        await show_category(query, category_id)
-        return
-    if data.startswith("prod:"):
-        _, currency_id, product_id = data.split(":")
-        currency_id = int(currency_id); product_id = int(product_id)
+
+    if data == "currency_back":
         session = sessions.get(user_id)
-        product = get_product(product_id)
-        if not session or not product or not product["enabled"]:
-            await query.answer("Please start a new order.", show_alert=True)
+        if not session:
+            await show_exchange(query)
             return
-        if product["category_id"] != session.get("category_id"):
-            await query.answer("This product is not in the current category.", show_alert=True)
-            return
-        session["currency_id"] = currency_id
-        session["product_id"] = product_id
-        session["price"] = get_custom_price(currency_id) if product["is_custom"] else get_price(currency_id, product_id)
-        if product["is_custom"]:
-            session["waiting"] = "custom_amount"
-            await edit_screen(query, render_text("custom"), cancel_keyboard())
-        else:
-            session["amount"] = product["amount"]
-            session["waiting"] = "username"
-            await edit_screen(query, render_text("username"), cancel_keyboard())
+        await show_currency_step(query, session["category_id"])
         return
 
-    # Everything below is admin-only.
-    admin_prefixes = (
-        "admin", "a:", "acat", "cedit", "cdelete", "ctoggle", "p_", "ptoggle", "pdelete",
-        "apickcat", "curadd", "cedit:", "c_name", "c_button", "ctogglecur", "cdeletecur", "corder",
-        "pricecur", "setprice", "setcustomprice", "text:", "button:", "set:", "toggle:", "emoji", "order:",
-        "orderstatus:", "adminadd", "adminremove", "acats", "category", "move_", "backup:", "misc:")
-    if data.startswith(admin_prefixes) and not is_admin(user):
-        await query.answer("⛔ Access denied.", show_alert=True)
+    if data.startswith("category:"):
+        category_id = int(data.split(":", 1)[1])
+        category = get_category(category_id)
+        if (
+            not category
+            or not category["enabled"]
+            or not category["visibility"]
+        ):
+            await query.answer(
+                "This category is not currently public.",
+                show_alert=True,
+            )
+            return
+        await show_currency_step(query, category_id)
         return
+
+    if data.startswith("currency:"):
+        currency_id = int(data.split(":", 1)[1])
+        await show_products_step(query, currency_id)
+        return
+
+    if data.startswith("product:"):
+        product_id = int(data.split(":", 1)[1])
+        session = sessions.get(user_id)
+
+        if not session or session.get("waiting") != "product":
+            await query.answer(
+                "Please start a new order.",
+                show_alert=True,
+            )
+            return
+
+        product = get_product(product_id)
+        if (
+            not product
+            or not product["enabled"]
+            or not product["visibility"]
+            or product["category_id"] != session.get("category_id")
+        ):
+            await query.answer(
+                "This product is unavailable.",
+                show_alert=True,
+            )
+            return
+
+        price = get_price(session["currency_id"], product_id)
+
+        session.update(
+            {
+                "product_id": product_id,
+                "product": product["name"],
+                "amount": product["amount"],
+                "price": price,
+                "waiting": "username",
+            }
+        )
+
+        await edit_screen(
+            query,
+            user_id,
+            render_text("username"),
+            cancel_keyboard(),
+        )
+        return
+
+    if data == "custom":
+        session = sessions.get(user_id)
+        if not session or not session.get("currency_id"):
+            await query.answer(
+                "Please start a new order.",
+                show_alert=True,
+            )
+            return
+
+        session["waiting"] = "custom_amount"
+        await edit_screen(
+            query,
+            user_id,
+            render_text("custom"),
+            cancel_keyboard(),
+        )
+        return
+
+    # --------------------------------------------------------
+    # ADMIN ACCESS CHECK
+    # --------------------------------------------------------
+
+    if data.startswith(ADMIN_PREFIXES):
+        if not is_admin(user):
+            await query.answer(
+                "⛔ Access denied.",
+                show_alert=True,
+            )
+            return
+
+    # --------------------------------------------------------
+    # ADMIN HOME
+    # --------------------------------------------------------
 
     if data == "admin":
-        sessions.pop(user_id, None)
-        await show_admin(query)
+        await edit_screen(
+            query,
+            user_id,
+            "⚙️ <b>ADMIN PANEL</b>\n\n"
+            "Manage your shop directly from Telegram.",
+            admin_keyboard(),
+        )
         return
 
-    # ---- Dashboard / Misc / Backup ----
-    if data == "a:dashboard":
-        await show_dashboard(query); return
-    if data == "a:misc":
-        await show_misc(query); return
-    if data == "misc:set_delay":
-        await ask_input(query, "setting:anti_spam_seconds", "⏱️ <b>ANTI-SPAM DELAY</b>\n\nSend a number between <code>0.5</code> and <code>30</code> seconds."); return
-    if data.startswith("misc:"):
-        key = {
-            "maintenance": "maintenance_mode",
-            "show_prices": "show_product_prices",
-            "history": "customer_order_history",
-            "anti_spam": "anti_spam",
-            "debug": "debug_mode",
-        }.get(data.split(":",1)[1])
-        if not key:
-            await query.answer("Unknown feature.", show_alert=True); return
-        set_setting(key, "0" if get_setting(key, "0") == "1" else "1")
-        logger.setLevel(logging.DEBUG if get_setting("debug_mode", "0") == "1" else logging.INFO)
-        await show_misc(query); return
-    if data == "a:backup":
-        await show_backup(query); return
-    if data == "backup:summary":
-        await edit_screen(query, "🔍 <b>BACKUP SUMMARY</b>\n\n" + backup_summary(), kb([[InlineKeyboardButton("💾 Backup & Restore", callback_data="a:backup")]])); return
-    if data == "backup:download":
-        await send_backup_file(context.bot, query.message.chat_id); return
-    if data == "backup:script":
-        try:
-            await send_embedded_script(context.bot, query.message.chat_id)
-            await query.answer("Updated script sent.")
-        except Exception as error:
-            logger.exception("Could not build updated script")
-            await query.answer("Could not build the script.", show_alert=True)
-        return
-    if data == "backup:import":
-        await ask_input(query, "backup_import", "📥 <b>IMPORT BACKUP</b>\n\nUpload your <code>srpexchange_backup.txt</code> file, or paste the backup string here.\n\nNothing is replaced until you confirm the restore.\n\n/cancel to abort."); return
-    if data == "backup:confirm":
-        blob = sessions.get(user_id, {}).get("backup_blob")
-        if not blob:
-            await query.answer("No backup is waiting.", show_alert=True); return
-        try:
-            payload = restore_backup(blob)
-            sessions.pop(user_id, None)
-            await edit_screen(query, "✅ <b>BACKUP RESTORED</b>\n\n" + backup_summary(payload), kb([[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]))
-        except Exception:
-            logger.exception("Backup restore failed")
-            await query.answer("Restore failed. Current data was left unchanged.", show_alert=True)
-        return
-    if data == "backup:cancel":
-        sessions.pop(user_id, None); await show_backup(query); return
+    # --------------------------------------------------------
+    # CATEGORIES
+    # --------------------------------------------------------
 
-    # ---- Categories ----
-    if data == "a:cats":
-        await show_admin_categories(query, None)
+    if data == "admin_categories":
+        await show_admin_categories(query)
         return
-    if data.startswith("acats:"):
-        value = data.split(":",1)[1]
-        await show_admin_categories(query, None if value == "root" else int(value))
+
+    if data == "add_category":
+        await start_add_category(query)
         return
-    if data.startswith("acat:"):
-        await show_category_edit(query, int(data.split(":",1)[1]))
+
+    if data.startswith("edit_category:"):
+        await show_edit_category(
+            query,
+            int(data.split(":", 1)[1]),
+        )
         return
-    if data.startswith("acat_add:"):
-        raw = data.split(":",1)[1]
-        parent_id = None if raw == "root" else int(raw)
-        await ask_input(query, "add_category", "➕ <b>ADD CATEGORY</b>\n\nSend the category name.", parent_id=parent_id)
+
+    if data.startswith("category_products:"):
+        await category_product_list(
+            query,
+            int(data.split(":", 1)[1]),
+        )
         return
-    if data.startswith("cedit_name:"):
-        await ask_input(query, "rename_category", "🔤 <b>RENAME CATEGORY</b>\n\nSend the new category name.", category_id=int(data.split(":",1)[1]))
+
+    if data.startswith("rename_category:"):
+        await ask_text_input(
+            query,
+            "rename_category",
+            "🔤 <b>RENAME CATEGORY</b>\n\nSend the new category name.",
+            category_id=int(data.split(":", 1)[1]),
+        )
         return
-    if data.startswith("cedit_button:"):
-        await ask_input(query, "category_button", "🔘 <b>CATEGORY BUTTON</b>\n\nSend the exact button text.", category_id=int(data.split(":",1)[1]))
+
+    if data.startswith("category_button:"):
+        await ask_text_input(
+            query,
+            "category_button",
+            "🔘 <b>CATEGORY BUTTON</b>\n\nSend the new button text.",
+            category_id=int(data.split(":", 1)[1]),
+        )
         return
-    if data.startswith("cedit_desc:"):
-        await ask_input(query, "category_desc", "📝 <b>CATEGORY DESCRIPTION</b>\n\nSend the description, or <code>-</code> for none.", category_id=int(data.split(":",1)[1]))
+
+    if data.startswith("category_desc:"):
+        await ask_text_input(
+            query,
+            "category_desc",
+            "📝 <b>CATEGORY DESCRIPTION</b>\n\n"
+            "Send the description shown under the currency step.\n"
+            "Send <code>-</code> for no description.",
+            category_id=int(data.split(":", 1)[1]),
+        )
         return
-    if data.startswith("cedit_move:"):
-        category_id = int(data.split(":",1)[1])
+
+    if data.startswith("toggle_category_visibility:"):
+        category_id = int(data.split(":", 1)[1])
+        conn = db()
+        conn.execute(
+            """
+            UPDATE categories
+            SET visibility = CASE WHEN visibility = 1 THEN 0 ELSE 1 END
+            WHERE id = ?
+            """,
+            (category_id,),
+        )
+        conn.commit()
+        conn.close()
+        await show_edit_category(query, category_id)
+        return
+
+    if data.startswith("toggle_category:"):
+        category_id = int(data.split(":", 1)[1])
+        conn = db()
+        conn.execute(
+            """
+            UPDATE categories
+            SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END
+            WHERE id = ?
+            """,
+            (category_id,),
+        )
+        conn.commit()
+        conn.close()
+        await show_edit_category(query, category_id)
+        return
+
+    if data.startswith("delete_category:"):
+        category_id = int(data.split(":", 1)[1])
+        category = get_category(category_id)
+
+        if not category:
+            await query.answer("Category not found.", show_alert=True)
+            return
+
+        product_count = len(get_products(category_id, False))
+        if product_count:
+            await query.answer(
+                "Move or delete the products in this category first.",
+                show_alert=True,
+            )
+            return
+
+        conn = db()
+        conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+        conn.commit()
+        conn.close()
+        await show_admin_categories(query)
+        return
+
+    if data.startswith("category_up:") or data.startswith("category_down:"):
+        category_id = int(data.split(":", 1)[1])
+        direction = -1 if data.startswith("category_up:") else 1
+
+        conn = db()
+        current = conn.execute(
+            "SELECT * FROM categories WHERE id = ?",
+            (category_id,),
+        ).fetchone()
+
+        if current:
+            neighbor = conn.execute(
+                """
+                SELECT * FROM categories
+                WHERE (sort_order < ? AND ? = -1)
+                   OR (sort_order > ? AND ? = 1)
+                ORDER BY sort_order
+                LIMIT 1
+                """,
+                (
+                    current["sort_order"],
+                    direction,
+                    current["sort_order"],
+                    direction,
+                ),
+            ).fetchone()
+
+            if neighbor:
+                conn.execute(
+                    "UPDATE categories SET sort_order = ? WHERE id = ?",
+                    (neighbor["sort_order"], current["id"]),
+                )
+                conn.execute(
+                    "UPDATE categories SET sort_order = ? WHERE id = ?",
+                    (current["sort_order"], neighbor["id"]),
+                )
+                conn.commit()
+
+        conn.close()
+        await show_admin_categories(query)
+        return
+
+    # --------------------------------------------------------
+    # PRODUCTS
+    # --------------------------------------------------------
+
+    if data == "admin_products":
+        await show_admin_products(query)
+        return
+
+    if data.startswith("add_product:"):
+        await start_add_product(
+            query,
+            int(data.split(":", 1)[1]),
+        )
+        return
+
+    if data.startswith("edit_product:"):
+        await show_edit_product(
+            query,
+            int(data.split(":", 1)[1]),
+        )
+        return
+
+    if data.startswith("rename_product:"):
+        await ask_text_input(
+            query,
+            "rename_product",
+            "🔤 <b>EDIT PRODUCT NAME</b>\n\nSend the new name.",
+            product_id=int(data.split(":", 1)[1]),
+        )
+        return
+
+    if data.startswith("product_button:"):
+        await ask_text_input(
+            query,
+            "product_button",
+            "🔘 <b>PRODUCT BUTTON</b>\n\nSend the new button text.",
+            product_id=int(data.split(":", 1)[1]),
+        )
+        return
+
+    if data.startswith("amount_product:"):
+        await ask_text_input(
+            query,
+            "change_product_amount",
+            "🔢 <b>CHANGE AMOUNT</b>\n\n"
+            "Send the new Robux amount.\n"
+            "Example: <code>2500</code>",
+            product_id=int(data.split(":", 1)[1]),
+        )
+        return
+
+    if data.startswith("product_desc:"):
+        await ask_text_input(
+            query,
+            "product_desc",
+            "📝 <b>PRODUCT DESCRIPTION</b>\n\n"
+            "Send a description, or <code>-</code> for none.",
+            product_id=int(data.split(":", 1)[1]),
+        )
+        return
+
+    if data.startswith("move_product:"):
+        product_id = int(data.split(":", 1)[1])
         rows = []
-        for c in get_all_categories(False):
-            if c["id"] == category_id or would_create_cycle(category_id, c["id"]):
-                continue
-            rows.append([InlineKeyboardButton(f"📂 {c['name']}", callback_data=f"cmove:{category_id}:{c['id']}")])
-        rows.append([InlineKeyboardButton("🌳 Root", callback_data=f"cmove:{category_id}:root")])
-        rows.append([InlineKeyboardButton("↩️ Category", callback_data=f"acat:{category_id}")])
-        await edit_screen(query, "↪️ <b>MOVE CATEGORY</b>\n\nChoose its new parent.", kb(rows))
+        product = get_product(product_id)
+
+        if not product:
+            await query.answer("Product not found.", show_alert=True)
+            return
+
+        for category in get_categories(False):
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"🗂️ {category['name']}",
+                        callback_data=f"move_to:{product_id}:{category['id']}",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "↩️ Product",
+                    callback_data=f"edit_product:{product_id}",
+                )
+            ]
+        )
+        await edit_screen(
+            query,
+            user_id,
+            "🗂️ <b>MOVE PRODUCT</b>\n\nChoose its new category.",
+            InlineKeyboardMarkup(rows),
+        )
         return
-    if data.startswith("cmove:"):
-        _, category_id, parent = data.split(":")
+
+    if data.startswith("move_to:"):
+        _, product_id, category_id = data.split(":")
+        product_id = int(product_id)
         category_id = int(category_id)
-        parent_id = None if parent == "root" else int(parent)
-        if would_create_cycle(category_id, parent_id):
-            await query.answer("That move would create a category loop.", show_alert=True)
-            return
+
         conn = db()
-        conn.execute("UPDATE categories SET parent_id=? WHERE id=?", (parent_id, category_id))
-        conn.commit(); conn.close()
-        await show_category_edit(query, category_id)
-        return
-    if data.startswith("ctoggle:"):
-        cid = int(data.split(":",1)[1])
-        conn = db(); conn.execute("UPDATE categories SET enabled=CASE WHEN enabled=1 THEN 0 ELSE 1 END WHERE id=?", (cid,)); conn.commit(); conn.close()
-        await show_category_edit(query, cid)
-        return
-    if data.startswith("cdelete:"):
-        cid = int(data.split(":",1)[1])
-        children = get_category_children(cid, False)
-        products = get_products(cid, False)
-        if children or products:
-            await query.answer("Delete or move its subcategories and products first.", show_alert=True)
-            return
-        category = get_category(cid)
-        parent = category["parent_id"] if category else None
-        conn = db(); conn.execute("DELETE FROM categories WHERE id=?", (cid,)); conn.commit(); conn.close()
-        await show_admin_categories(query, parent)
+        conn.execute(
+            "UPDATE products SET category_id = ? WHERE id = ?",
+            (category_id, product_id),
+        )
+        conn.commit()
+        conn.close()
+
+        await show_edit_product(query, product_id)
         return
 
-    # ---- Products ----
-    if data == "a:products":
+    if data.startswith("toggle_product_visibility:"):
+        product_id = int(data.split(":", 1)[1])
+        conn = db()
+        conn.execute(
+            """
+            UPDATE products
+            SET visibility = CASE WHEN visibility = 1 THEN 0 ELSE 1 END
+            WHERE id = ?
+            """,
+            (product_id,),
+        )
+        conn.commit()
+        conn.close()
+        await show_edit_product(query, product_id)
+        return
+
+    if data.startswith("toggle_product:"):
+        product_id = int(data.split(":", 1)[1])
+
+        conn = db()
+        conn.execute(
+            """
+            UPDATE products
+            SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END
+            WHERE id = ?
+            """,
+            (product_id,),
+        )
+        conn.commit()
+        conn.close()
+
+        await show_edit_product(query, product_id)
+        return
+
+    if data.startswith("delete_product:"):
+        product_id = int(data.split(":", 1)[1])
+
+        conn = db()
+        conn.execute(
+            "DELETE FROM prices WHERE product_id = ?",
+            (product_id,),
+        )
+        conn.execute(
+            "DELETE FROM products WHERE id = ?",
+            (product_id,),
+        )
+        conn.commit()
+        conn.close()
+
         await show_admin_products(query)
         return
-    if data == "apickcat":
-        rows = [[InlineKeyboardButton(f"📂 {c['name']}", callback_data=f"paddcat:{c['id']}")] for c in get_all_categories(False)]
-        rows.append([InlineKeyboardButton("↩️ Products", callback_data="a:products")])
-        await edit_screen(query, "➕ <b>ADD PRODUCT</b>\n\nChoose the category/subcategory where it belongs.", kb(rows))
+
+    if data.startswith("product_prices:"):
+        await show_product_prices(
+            query,
+            int(data.split(":", 1)[1]),
+        )
         return
-    if data.startswith("paddcat:"):
-        await ask_input(query, "add_product_name", "➕ <b>ADD PRODUCT</b>\n\nSend the product name.", category_id=int(data.split(":",1)[1]))
+
+    if data.startswith("product_up:") or data.startswith("product_down:"):
+        product_id = int(data.split(":", 1)[1])
+        direction = -1 if data.startswith("product_up:") else 1
+
+        product = get_product(product_id)
+        if product:
+            conn = db()
+            current = conn.execute(
+                "SELECT * FROM products WHERE id = ?",
+                (product_id,),
+            ).fetchone()
+
+            neighbor = conn.execute(
+                """
+                SELECT *
+                FROM products
+                WHERE category_id = ?
+                  AND (
+                      (sort_order < ? AND ? = -1)
+                      OR
+                      (sort_order > ? AND ? = 1)
+                  )
+                ORDER BY sort_order
+                LIMIT 1
+                """,
+                (
+                    current["category_id"],
+                    current["sort_order"],
+                    direction,
+                    current["sort_order"],
+                    direction,
+                ),
+            ).fetchone()
+
+            if neighbor:
+                conn.execute(
+                    "UPDATE products SET sort_order = ? WHERE id = ?",
+                    (neighbor["sort_order"], current["id"]),
+                )
+                conn.execute(
+                    "UPDATE products SET sort_order = ? WHERE id = ?",
+                    (current["sort_order"], neighbor["id"]),
+                )
+                conn.commit()
+            conn.close()
+
+        await show_edit_product(query, product_id)
         return
-    if data.startswith("a_product:"):
-        await show_product_edit(query, int(data.split(":",1)[1]))
+
+    # --------------------------------------------------------
+    # CURRENCIES
+    # --------------------------------------------------------
+
+    if data == "admin_currencies":
+        await show_admin_currencies(query)
         return
-    if data.startswith("p_duplicate:"):
-        source_id = int(data.split(":",1)[1])
-        source = get_product(source_id)
-        if not source:
-            await query.answer("Product not found.", show_alert=True); return
+
+    if data == "add_currency":
+        await start_add_currency(query)
+        return
+
+    if data.startswith("edit_currency:"):
+        await show_edit_currency(
+            query,
+            int(data.split(":", 1)[1]),
+        )
+        return
+
+    if data.startswith("rename_currency:"):
+        await ask_text_input(
+            query,
+            "rename_currency",
+            "🔤 <b>EDIT PAYMENT METHOD NAME</b>\n\nSend the new name.",
+            currency_id=int(data.split(":", 1)[1]),
+        )
+        return
+
+    if data.startswith("currency_button:"):
+        await ask_text_input(
+            query,
+            "currency_button",
+            "🔘 <b>PAYMENT BUTTON</b>\n\nSend the new button text.",
+            currency_id=int(data.split(":", 1)[1]),
+        )
+        return
+
+    if data.startswith("toggle_currency:"):
+        currency_id = int(data.split(":", 1)[1])
         conn = db()
-        sort_order = conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM products WHERE category_id=?", (source["category_id"],)).fetchone()["n"]
-        cur = conn.execute("INSERT INTO products(name,button_text,amount,enabled,sort_order,category_id,description,is_custom) VALUES (?,?,?,?,?,?,?,?)", (f"{source['name']} Copy", source["button_text"], source["amount"], source["enabled"], sort_order, source["category_id"], source["description"], source["is_custom"]))
-        new_id = cur.lastrowid
-        for c in conn.execute("SELECT id FROM currencies").fetchall():
-            row = conn.execute("SELECT price FROM prices WHERE currency_id=? AND product_id=?", (c["id"], source_id)).fetchone()
-            conn.execute("INSERT OR REPLACE INTO prices(currency_id,product_id,price) VALUES (?,?,?)", (c["id"],new_id,row["price"] if row else "NA"))
-        conn.commit(); conn.close()
-        await show_product_edit(query, new_id); return
-    if data.startswith("p_name:"):
-        await ask_input(query, "product_name", "🔤 <b>PRODUCT NAME</b>\n\nSend the new product name.", product_id=int(data.split(":",1)[1]))
-        return
-    if data.startswith("p_button:"):
-        await ask_input(query, "product_button", "🔘 <b>PRODUCT BUTTON</b>\n\nSend the exact button text.", product_id=int(data.split(":",1)[1]))
-        return
-    if data.startswith("p_amount:"):
-        await ask_input(query, "product_amount", "🔢 <b>ROBux AMOUNT</b>\n\nSend a positive whole number.\nSend <code>custom</code> to make it a custom-amount product.", product_id=int(data.split(":",1)[1]))
-        return
-    if data.startswith("p_desc:"):
-        await ask_input(query, "product_desc", "📝 <b>PRODUCT DESCRIPTION</b>\n\nSend a description, or <code>-</code> for none.", product_id=int(data.split(":",1)[1]))
-        return
-    if data.startswith("p_move:"):
-        pid = int(data.split(":",1)[1])
-        rows = [[InlineKeyboardButton(f"📂 {c['name']}", callback_data=f"pmove:{pid}:{c['id']}")] for c in get_all_categories(False)]
-        rows.append([InlineKeyboardButton("↩️ Product", callback_data=f"a_product:{pid}")])
-        await edit_screen(query, "📂 <b>MOVE PRODUCT</b>\n\nChoose its new category or subcategory.", kb(rows))
-        return
-    if data.startswith("pmove:"):
-        _, pid, cid = data.split(":")
-        conn = db(); conn.execute("UPDATE products SET category_id=? WHERE id=?", (int(cid), int(pid))); conn.commit(); conn.close()
-        await show_product_edit(query, int(pid))
-        return
-    if data.startswith("ptoggle:"):
-        pid = int(data.split(":",1)[1])
-        conn = db(); conn.execute("UPDATE products SET enabled=CASE WHEN enabled=1 THEN 0 ELSE 1 END WHERE id=?", (pid,)); conn.commit(); conn.close()
-        await show_product_edit(query, pid)
-        return
-    if data.startswith("pdelete:"):
-        pid = int(data.split(":",1)[1])
-        conn = db(); conn.execute("DELETE FROM prices WHERE product_id=?", (pid,)); conn.execute("DELETE FROM products WHERE id=?", (pid,)); conn.commit(); conn.close()
-        await show_admin_products(query)
-        return
-    if data.startswith("p_prices:"):
-        pid = int(data.split(":",1)[1])
-        p = get_product(pid)
-        if not p:
-            await query.answer("Product not found.", show_alert=True); return
-        rows = []
-        for c in get_currencies(False):
-            price = get_custom_price(c["id"]) if p["is_custom"] else get_price(c["id"], pid)
-            rows.append([InlineKeyboardButton(f"{c['name']} → {price}", callback_data=f"setprice:{c['id']}:{pid}")])
-        rows.append([InlineKeyboardButton("↩️ Product", callback_data=f"a_product:{pid}")])
-        await edit_screen(query, f"💰 <b>PRICES — {esc(p['button_text'])}</b>\n\nChoose a currency.", kb(rows))
+        conn.execute(
+            """
+            UPDATE currencies
+            SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END
+            WHERE id = ?
+            """,
+            (currency_id,),
+        )
+        conn.commit()
+        conn.close()
+        await show_edit_currency(query, currency_id)
         return
 
-    # ---- Currencies ----
-    if data == "a:currencies":
-        await show_admin_currencies(query); return
-    if data == "curadd":
-        await ask_input(query, "add_currency", "➕ <b>ADD CURRENCY</b>\n\nSend the currency/payment method name.")
+    if data.startswith("delete_currency:"):
+        currency_id = int(data.split(":", 1)[1])
+        conn = db()
+        conn.execute(
+            "DELETE FROM prices WHERE currency_id = ?",
+            (currency_id,),
+        )
+        conn.execute(
+            "DELETE FROM custom_prices WHERE currency_id = ?",
+            (currency_id,),
+        )
+        conn.execute(
+            "DELETE FROM currencies WHERE id = ?",
+            (currency_id,),
+        )
+        conn.commit()
+        conn.close()
+        await show_admin_currencies(query)
         return
-    if data.startswith("cedit:"):
-        await show_currency_edit(query, int(data.split(":",1)[1])); return
-    if data.startswith("c_name:"):
-        await ask_input(query, "currency_name", "🔤 <b>CURRENCY NAME</b>\n\nSend the new name.", currency_id=int(data.split(":",1)[1])); return
-    if data.startswith("c_button:"):
-        await ask_input(query, "currency_button", "🔘 <b>CURRENCY BUTTON</b>\n\nSend the exact button text.", currency_id=int(data.split(":",1)[1])); return
-    if data.startswith("ctogglecur:"):
-        cid = int(data.split(":",1)[1])
-        conn = db(); conn.execute("UPDATE currencies SET enabled=CASE WHEN enabled=1 THEN 0 ELSE 1 END WHERE id=?", (cid,)); conn.commit(); conn.close()
-        await show_currency_edit(query, cid); return
-    if data.startswith("cdeletecur:"):
-        cid = int(data.split(":",1)[1])
-        if len(get_currencies(False)) <= 1:
-            await query.answer("Keep at least one currency.", show_alert=True); return
-        conn = db(); conn.execute("DELETE FROM prices WHERE currency_id=?", (cid,)); conn.execute("DELETE FROM custom_prices WHERE currency_id=?", (cid,)); conn.execute("DELETE FROM currencies WHERE id=?", (cid,)); conn.commit(); conn.close()
-        await show_admin_currencies(query); return
 
-    # ---- Prices ----
-    if data == "a:prices":
-        await edit_screen(query, "💰 <b>PRICE MANAGEMENT</b>\n\nChoose a currency, then choose a product price.", admin_prices_keyboard()); return
-    if data.startswith("pricecur:"):
-        await show_price_currency(query, int(data.split(":",1)[1])); return
-    if data.startswith("setprice:"):
-        _, cid, pid = data.split(":")
-        await ask_input(query, "set_price", "💰 <b>SET PRICE</b>\n\nSend the new price exactly as it should appear.\n\nExamples: <code>50</code> · <code>50 ⭐</code> · <code>NA</code>", currency_id=int(cid), product_id=int(pid)); return
-    if data.startswith("setcustomprice:"):
-        await ask_input(query, "set_custom_price", "✏️ <b>CUSTOM AMOUNT PRICE</b>\n\nSend the price text.\n\nExample: <code>NA</code>", currency_id=int(data.split(":",1)[1])); return
+    if data.startswith("prices_currency:"):
+        await show_currency_prices(
+            query,
+            int(data.split(":", 1)[1]),
+        )
+        return
 
-    # ---- Texts / Buttons / Settings ----
-    if data == "a:texts":
-        await show_texts(query); return
-    if data.startswith("text:"):
-        key = data.split(":",1)[1]
-        await ask_input(
+    if data.startswith("currency_up:") or data.startswith("currency_down:"):
+        currency_id = int(data.split(":", 1)[1])
+        direction = -1 if data.startswith("currency_up:") else 1
+
+        conn = db()
+        current = conn.execute(
+            "SELECT * FROM currencies WHERE id = ?",
+            (currency_id,),
+        ).fetchone()
+
+        if current:
+            neighbor = conn.execute(
+                """
+                SELECT *
+                FROM currencies
+                WHERE (sort_order < ? AND ? = -1)
+                   OR (sort_order > ? AND ? = 1)
+                ORDER BY sort_order
+                LIMIT 1
+                """,
+                (
+                    current["sort_order"],
+                    direction,
+                    current["sort_order"],
+                    direction,
+                ),
+            ).fetchone()
+
+            if neighbor:
+                conn.execute(
+                    "UPDATE currencies SET sort_order = ? WHERE id = ?",
+                    (neighbor["sort_order"], current["id"]),
+                )
+                conn.execute(
+                    "UPDATE currencies SET sort_order = ? WHERE id = ?",
+                    (current["sort_order"], neighbor["id"]),
+                )
+                conn.commit()
+
+        conn.close()
+        await show_admin_currencies(query)
+        return
+
+    # --------------------------------------------------------
+    # PRICES
+    # --------------------------------------------------------
+
+    if data == "admin_prices":
+        await show_admin_prices(query)
+        return
+
+    if data.startswith("set_price:"):
+        _, currency_id, product_id = data.split(":")
+        await ask_text_input(
+            query,
+            "set_price",
+            "💰 <b>SET PRICE</b>\n\n"
+            "Send the new price exactly as it should appear.\n\n"
+            "Examples:\n"
+            "<code>50</code>\n"
+            "<code>50 ⭐</code>\n"
+            "<code>100 Stars</code>\n"
+            "<code>NA</code>",
+            currency_id=int(currency_id),
+            product_id=int(product_id),
+        )
+        return
+
+    if data.startswith("set_custom:"):
+        await ask_text_input(
+            query,
+            "set_custom_price",
+            "✏️ <b>CUSTOM AMOUNT PRICE</b>\n\n"
+            "Send the price shown for custom amounts.\n\n"
+            "Example: <code>NA</code>",
+            currency_id=int(data.split(":", 1)[1]),
+        )
+        return
+
+    # --------------------------------------------------------
+    # TEXTS / BUTTONS / SETTINGS
+    # --------------------------------------------------------
+
+    if data == "admin_texts":
+        await show_texts(query)
+        return
+
+    if data.startswith("edit_text:"):
+        key = data.split(":", 1)[1]
+        current = get_text(key)
+
+        placeholder_help = (
+            "Available placeholders:\n"
+            "<code>{shop_name}</code> <code>{admin_username}</code> "
+            "<code>{order_number}</code> <code>{category}</code> "
+            "<code>{currency}</code> <code>{product}</code> "
+            "<code>{amount}</code> <code>{price}</code> "
+            "<code>{roblox_username}</code> <code>{customer_name}</code> "
+            "<code>{customer_username}</code> <code>{telegram_id}</code> "
+            "<code>{created_at}</code> <code>{max_custom_amount}</code>"
+        )
+
+        await ask_text_input(
             query,
             "edit_text",
             "📝 <b>EDIT TEXT</b>\n\n"
-            f"<b>{esc(text_label(key))}</b>\n\n"
-            f"Current:\n<code>{esc(get_text(key))}</code>\n\n"
-            "HTML is supported.\n"
-            "Custom emoji example: <code>{{emoji:smile}}</code>\n"
-            "Dynamic placeholders are available for templates.",
+            f"<b>{clean(TEXT_NAMES.get(key, key))}</b>\n\n"
+            "<b>Current:</b>\n"
+            f"<code>{clean(current)}</code>\n\n"
+            "Send the new text. HTML is supported.\n\n"
+            f"{placeholder_help}\n\n"
+            "/cancel to stop.",
             key=key,
-        ); return
-    if data == "a:buttons":
-        await show_buttons(query); return
-    if data.startswith("button:"):
-        key = data.split(":",1)[1]
-        await ask_input(query, "edit_button", "🔘 <b>EDIT BUTTON</b>\n\n" f"Current:\n<b>{esc(get_button(key))}</b>\n\nSend the new button text.", key=key); return
-    if data == "a:settings":
-        await show_settings(query); return
-    if data == "toggle:cleanup":
-        set_setting("delete_user_messages", "0" if get_setting("delete_user_messages","0") == "1" else "1")
-        await show_settings(query); return
-    if data == "toggle:admin_button":
-        set_setting("show_admin_button", "0" if get_setting("show_admin_button","1") == "1" else "1")
-        await show_settings(query); return
-    if data.startswith("set:"):
-        key = data.split(":",1)[1]
-        prompts = {
-            "shop_name": "🏷️ <b>SHOP NAME</b>\n\nSend the new shop name.",
-            "admin_username": "👤 <b>SUPPORT USERNAME</b>\n\nSend the username shown to customers. Example: <code>@yourusername</code>",
-            "recipient": "🆔 <b>ORDER RECIPIENT CHAT ID</b>\n\nSend the numeric Telegram chat ID that receives new orders.",
-            "max_amount": "🔢 <b>MAX CUSTOM AMOUNT</b>\n\nSend the maximum allowed custom Robux amount.",
-        }
-        await ask_input(query, f"setting:{key}", prompts[key]); return
-
-    # ---- Custom emoji manager ----
-    if data == "a:emojis":
-        await show_emojis(query); return
-    if data == "emoji_add":
-        await ask_input(query, "add_emoji_name", "✨ <b>ADD CUSTOM EMOJI</b>\n\nFirst send a short name for this emoji.\n\nExample: <code>smile</code>"); return
-    if data.startswith("emoji:"):
-        await show_emoji_edit(query, int(data.split(":",1)[1])); return
-    if data.startswith("emoji_name:"):
-        await ask_input(query, "emoji_rename", "🔤 <b>RENAME CUSTOM EMOJI</b>\n\nSend the new token name. Letters, numbers, _ and - only.", emoji_id=int(data.split(":",1)[1])); return
-    if data.startswith("emoji_toggle:"):
-        eid = int(data.split(":",1)[1]); toggle_emoji(eid); await show_emoji_edit(query, eid); return
-    if data.startswith("emoji_delete:"):
-        eid = int(data.split(":",1)[1]); delete_emoji(eid); await show_emojis(query); return
-
-    # ---- Admins ----
-    if data == "a:admins":
-        await show_admins(query); return
-    if data == "adminadd":
-        await ask_input(query, "add_admin", "➕ <b>ADD ADMIN</b>\n\nSend the admin's numeric Telegram ID."); return
-    if data.startswith("adminremove:"):
-        target = int(data.split(":",1)[1])
-        if BOOTSTRAP_ADMIN_CHAT_ID:
-            try:
-                if target == int(BOOTSTRAP_ADMIN_CHAT_ID):
-                    await query.answer("The bootstrap admin cannot be removed.", show_alert=True); return
-            except ValueError:
-                pass
-        remove_admin(target); await show_admins(query); return
-
-    # ---- Orders ----
-    if data == "a:orders":
-        await show_orders(query); return
-    if data == "a:users":
-        await show_users(query); return
-    if data.startswith("order:"):
-        order_number = data.split(":",1)[1]
-        o = get_order(order_number)
-        if not o:
-            await query.answer("Order not found.", show_alert=True); return
-        status = esc(o["status"])
-        await edit_screen(
-            query,
-            "🔔 <b>ORDER DETAILS</b>\n\n"
-            f"🔐 Order: <code>{esc(o['order_number'])}</code>\n"
-            f"🗂️ Category: <b>{esc(o['category'])}</b>\n"
-            f"💱 Payment: <b>{esc(o['currency'])}</b>\n"
-            f"📦 Product: <b>{esc(o['product'])}</b>\n"
-            f"💰 Amount: <b>{o['robux_amount']:,} Robux</b>\n"
-            f"💵 Price: <b>{esc(o['price'])}</b>\n"
-            f"👤 Roblox: <code>{esc(o['roblox_username'])}</code>\n"
-            f"👤 Customer: <b>{esc(o['telegram_name'] or '')}</b>\n"
-            f"📱 Telegram: <b>{esc('@'+o['telegram_username']) if o['telegram_username'] else 'No username'}</b>\n"
-            f"🆔 Chat ID: <code>{o['telegram_id']}</code>\n"
-            f"📅 Created: <b>{esc(o['created_at'])}</b>\n"
-            f"📌 Status: <b>{status}</b>",
-            kb([
-                [InlineKeyboardButton("✅ Confirmed", callback_data=f"orderstatus:confirmed:{order_number}"),
-                 InlineKeyboardButton("❌ Rejected", callback_data=f"orderstatus:rejected:{order_number}")],
-                [InlineKeyboardButton("⏳ Awaiting", callback_data=f"orderstatus:awaiting_confirmation:{order_number}")],
-                [InlineKeyboardButton("↩️ Orders", callback_data="a:orders")],
-            ]),
         )
         return
-    if data.startswith("orderstatus:"):
-        _, status, order_number = data.split(":",2)
-        o = get_order(order_number)
-        if not o:
-            await query.answer("Order not found.", show_alert=True); return
+
+    if data == "admin_buttons":
+        await show_buttons(query)
+        return
+
+    if data.startswith("edit_button:"):
+        key = data.split(":", 1)[1]
+        await ask_text_input(
+            query,
+            "edit_button",
+            "🔘 <b>EDIT BUTTON</b>\n\n"
+            f"Current: <b>{clean(get_button(key))}</b>\n\n"
+            "Send the new button text.",
+            key=key,
+        )
+        return
+
+    if data == "admin_settings":
+        await show_settings(query)
+        return
+
+    if data == "change_shop_name":
+        await ask_text_input(
+            query,
+            "change_shop_name",
+            "🏷️ <b>SHOP NAME</b>\n\n"
+            "Send the new shop name.",
+        )
+        return
+
+    if data == "change_admin_username":
+        await ask_text_input(
+            query,
+            "change_admin_username",
+            "👤 <b>SUPPORT USERNAME</b>\n\n"
+            "Send the username customers should recognize.\n"
+            "Example: <code>@yourusername</code>",
+        )
+        return
+
+    if data == "change_recipient":
+        await ask_text_input(
+            query,
+            "change_recipient",
+            "🆔 <b>ORDER RECIPIENT CHAT ID</b>\n\n"
+            "Send the numeric Telegram chat ID that should receive new orders.",
+        )
+        return
+
+    if data == "change_max_amount":
+        await ask_text_input(
+            query,
+            "change_max_amount",
+            "🔢 <b>MAX CUSTOM AMOUNT</b>\n\n"
+            "Send the maximum allowed custom Robux amount.\n"
+            "Example: <code>1000000</code>",
+        )
+        return
+
+    if data == "toggle_cleanup":
+        current = get_setting("delete_user_messages", "1")
+        set_setting("delete_user_messages", "0" if current == "1" else "1")
+        await show_settings(query)
+        return
+
+    # --------------------------------------------------------
+    # ADMINS
+    # --------------------------------------------------------
+
+    if data == "admin_admins":
+        await show_admins(query)
+        return
+
+    if data == "add_admin":
+        await ask_text_input(
+            query,
+            "add_admin_id",
+            "➕ <b>ADD ADMIN</b>\n\n"
+            "Send the admin's numeric Telegram ID.\n\n"
+            "Example: <code>123456789</code>",
+        )
+        return
+
+    if data.startswith("remove_admin_confirm:"):
+        target_id = int(data.split(":", 1)[1])
+        await edit_screen(
+            query,
+            user_id,
+            f"⚠️ <b>REMOVE ADMIN?</b>\n\n"
+            f"Telegram ID: <code>{target_id}</code>",
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Remove",
+                            callback_data=f"remove_admin:{target_id}",
+                        ),
+                        InlineKeyboardButton(
+                            "↩️ Keep",
+                            callback_data="admin_admins",
+                        ),
+                    ]
+                ]
+            ),
+        )
+        return
+
+    if data.startswith("remove_admin:"):
+        target_id = int(data.split(":", 1)[1])
+
+        if BOOTSTRAP_ADMIN_CHAT_ID:
+            try:
+                if target_id == int(BOOTSTRAP_ADMIN_CHAT_ID):
+                    await query.answer(
+                        "The bootstrap admin cannot be removed.",
+                        show_alert=True,
+                    )
+                    return
+            except ValueError:
+                pass
+
+        remove_admin(target_id)
+        await show_admins(query)
+        return
+
+    # --------------------------------------------------------
+    # ORDERS
+    # --------------------------------------------------------
+
+    if data == "admin_orders":
+        orders = get_orders(25)
+
+        if not orders:
+            await edit_screen(
+                query,
+                user_id,
+                "📋 <b>ORDERS</b>\n\nNo orders yet.",
+                InlineKeyboardMarkup(back_to_admin()),
+            )
+            return
+
+        rows = []
+        for order in orders:
+            status_icon = (
+                "⏳"
+                if order["status"] == "awaiting_confirmation"
+                else "✅"
+                if order["status"] == "confirmed"
+                else "❌"
+            )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{status_icon} {order['order_number']} · {order['roblox_username']}",
+                        callback_data=f"order:{order['order_number']}",
+                    )
+                ]
+            )
+
+        rows.extend(back_to_admin())
+
+        await edit_screen(
+            query,
+            user_id,
+            "📋 <b>RECENT ORDERS</b>\n\n"
+            "Tap an order to view its full details.",
+            InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("order:"):
+        order_number = data.split(":", 1)[1]
+        order = get_order(order_number)
+
+        if not order:
+            await query.answer("Order not found.", show_alert=True)
+            return
+
+        await edit_screen(
+            query,
+            user_id,
+            "🔔 <b>ORDER DETAILS</b>\n\n"
+            f"🔐 Code: <code>{clean(order['order_number'])}</code>\n"
+            f"🗂️ Category: <b>{clean(order['category'])}</b>\n"
+            f"💱 Payment: <b>{clean(order['currency'])}</b>\n"
+            f"📦 Product: <b>{clean(order['product'])}</b>\n"
+            f"💰 Amount: <b>{order['robux_amount']:,} Robux</b>\n"
+            f"💵 Price: <b>{clean(order['price'])}</b>\n"
+            f"👤 Roblox: <code>{clean(order['roblox_username'])}</code>\n"
+            f"👤 Customer: <b>{clean(order['telegram_name'])}</b>\n"
+            f"📱 Telegram: <b>{clean('@' + order['telegram_username']) if order['telegram_username'] else 'No username'}</b>\n"
+            f"🆔 Chat ID: <code>{order['telegram_id']}</code>\n"
+            f"📅 Created: <b>{clean(order['created_at'])}</b>\n"
+            f"⏳ Status: <b>{clean(order['status'])}</b>",
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Confirmed",
+                            callback_data=f"order_status:confirmed:{order_number}",
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Rejected",
+                            callback_data=f"order_status:rejected:{order_number}",
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "↩️ Orders",
+                            callback_data="admin_orders",
+                        )
+                    ],
+                ]
+            ),
+        )
+        return
+
+    if data.startswith("order_status:"):
+        _, status, order_number = data.split(":", 2)
+        order = get_order(order_number)
+        if not order:
+            await query.answer("Order not found.", show_alert=True)
+            return
+
         set_order_status(order_number, status)
-        # Notify the customer. This works because they placed the order and interacted with the bot.
-        customer_notice = {
-            "confirmed": "✅ <b>ORDER CONFIRMED</b>\n\nYour order <code>{}</code> has been confirmed.",
-            "rejected": "❌ <b>ORDER REJECTED</b>\n\nYour order <code>{}</code> was rejected. Please contact the support account if you need help.",
-            "awaiting_confirmation": "⏳ <b>ORDER UPDATED</b>\n\nYour order <code>{}</code> is still awaiting confirmation.",
-        }[status].format(esc(order_number))
+
+        # Notify customer using the same secret code.
+        notification = {
+            "confirmed": (
+                "✅ <b>ORDER CONFIRMED</b>\n\n"
+                "🔐 Code: <code>{order_number}</code>\n\n"
+                "Your order has been confirmed."
+            ),
+            "rejected": (
+                "❌ <b>ORDER REJECTED</b>\n\n"
+                "🔐 Code: <code>{order_number}</code>\n\n"
+                "Your order was rejected by the team. Please contact support if you need help."
+            ),
+        }[status].format(order_number=clean(order_number))
+
         try:
-            await context.bot.send_message(chat_id=o["telegram_id"], text=customer_notice, parse_mode="HTML")
+            await context.bot.send_message(
+                chat_id=order["telegram_id"],
+                text=notification,
+                parse_mode="HTML",
+            )
         except TelegramError as error:
-            logger.warning("Customer status notification failed for %s: %s", order_number, error)
-        await query.answer("Order updated.")
-        await show_orders(query)
+            logger.warning(
+                "Could not notify customer for order %s: %s",
+                order_number,
+                error,
+            )
+
+        await edit_screen(
+            query,
+            user_id,
+            "✅ <b>ORDER UPDATED</b>\n\n"
+            f"Order <code>{clean(order_number)}</code> is now <b>{clean(status)}</b>.",
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "📋 Orders",
+                            callback_data="admin_orders",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "⚙️ Admin Panel",
+                            callback_data="admin",
+                        )
+                    ],
+                ]
+            ),
+        )
         return
 
-    # Reorder callbacks intentionally handled as text input because they are clearer.
-    if data.startswith("cedit_order:"):
-        await ask_input(query, "category_order", "↕️ <b>CATEGORY ORDER</b>\n\nSend a whole-number sort position. Lower numbers appear first.", category_id=int(data.split(":",1)[1])); return
-    if data.startswith("p_order:"):
-        await ask_input(query, "product_order", "↕️ <b>PRODUCT ORDER</b>\n\nSend a whole-number sort position. Lower numbers appear first.", product_id=int(data.split(":",1)[1])); return
-    if data.startswith("corder:"):
-        await ask_input(query, "currency_order", "↕️ <b>CURRENCY ORDER</b>\n\nSend a whole-number sort position. Lower numbers appear first.", currency_id=int(data.split(":",1)[1])); return
 
+# ============================================================
+# ADMIN TEXT INPUT
+# ============================================================
 
-async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message or not message.document:
-        return
+async def handle_admin_input(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session,
+    text,
+):
     user = update.effective_user
-    upsert_user(user, update.effective_chat.id)
-    session = sessions.get(user.id)
-    if not is_admin(user) or not session or session.get("action") != "backup_import":
+    user_id = user.id
+    action = session.get("action")
+
+    if action == "add_category_name":
+        name = text.strip()
+        if not name:
+            return
+
+        try:
+            conn = db()
+            max_order = conn.execute(
+                "SELECT COALESCE(MAX(sort_order), 0) AS n FROM categories"
+            ).fetchone()["n"]
+
+            cursor = conn.execute(
+                """
+                INSERT INTO categories
+                (name, button_text, description, enabled, sort_order)
+                VALUES (?, ?, '', 1, ?)
+                """,
+                (name, name, max_order + 1),
+            )
+            category_id = cursor.lastrowid
+            conn.commit()
+            conn.close()
+        except sqlite3.IntegrityError:
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                "⚠️ <b>CATEGORY ALREADY EXISTS</b>\n\n"
+                "Choose another name.",
+            )
+            return
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>CATEGORY CREATED</b>\n\n"
+            f"🗂️ {clean(name)}",
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🗂️ Categories",
+                            callback_data="admin_categories",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "⚙️ Admin Panel",
+                            callback_data="admin",
+                        )
+                    ],
+                ]
+            ),
+        )
         return
-    try:
-        tg_file = await context.bot.get_file(message.document.file_id)
-        blob = bytes(await tg_file.download_as_bytearray()).decode("utf-8")
-        payload = decode_backup(blob)
-        session["backup_blob"] = blob.strip()
-        session["action"] = "backup_confirm"
-        await send_or_edit_screen(context.bot, update.effective_chat.id, user.id,
-            "⚠️ <b>CONFIRM BACKUP RESTORE</b>\n\n" + backup_summary(payload) + "\n\n"
-            "This will replace the current shop data. Your bootstrap admin is restored afterward.",
-            kb([[InlineKeyboardButton("✅ Restore Backup", callback_data="backup:confirm")], [InlineKeyboardButton("❌ Cancel", callback_data="backup:cancel")]]))
-    except Exception as error:
-        await send_or_edit_screen(context.bot, update.effective_chat.id, user.id, f"⚠️ <b>INVALID BACKUP</b>\n\n{esc(error)}", cancel_keyboard())
-    finally:
-        await cleanup_user_message(update)
+
+    if action == "rename_category":
+        category_id = session["category_id"]
+        try:
+            conn = db()
+            conn.execute(
+                "UPDATE categories SET name = ? WHERE id = ?",
+                (text, category_id),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.IntegrityError:
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                "⚠️ Another category already uses that name.",
+            )
+            return
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>CATEGORY UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "🗂️ Categories",
+                        callback_data="admin_categories",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "category_button":
+        conn = db()
+        conn.execute(
+            "UPDATE categories SET button_text = ? WHERE id = ?",
+            (text, session["category_id"]),
+        )
+        conn.commit()
+        conn.close()
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>CATEGORY BUTTON UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "🗂️ Categories",
+                        callback_data="admin_categories",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "category_desc":
+        description = "" if text == "-" else text
+        conn = db()
+        conn.execute(
+            "UPDATE categories SET description = ? WHERE id = ?",
+            (description, session["category_id"]),
+        )
+        conn.commit()
+        conn.close()
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>CATEGORY DESCRIPTION UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "🗂️ Categories",
+                        callback_data="admin_categories",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "add_product_name":
+        session["product_name"] = text
+        session["action"] = "add_product_amount"
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "🔢 <b>PRODUCT AMOUNT</b>\n\n"
+            "Send the amount of Robux.\n"
+            "Example: <code>2000</code>",
+        )
+        return
+
+    if action == "add_product_amount":
+        cleaned = text.replace(",", "").replace(" ", "")
+
+        if not cleaned.isdigit():
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                "⚠️ Please enter numbers only.\n\nExample: <code>2000</code>",
+            )
+            return
+
+        amount = int(cleaned)
+        if amount <= 0:
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                "⚠️ Amount must be greater than 0.",
+            )
+            return
+
+        category_id = session["category_id"]
+
+        conn = db()
+        max_order = conn.execute(
+            """
+            SELECT COALESCE(MAX(sort_order), 0) AS n
+            FROM products
+            WHERE category_id = ?
+            """,
+            (category_id,),
+        ).fetchone()["n"]
+
+        cursor = conn.execute(
+            """
+            INSERT INTO products
+            (name, button_text, amount, category_id, description, enabled, sort_order)
+            VALUES (?, ?, ?, ?, '', 1, ?)
+            """,
+            (
+                session["product_name"],
+                session["product_name"],
+                amount,
+                category_id,
+                max_order + 1,
+            ),
+        )
+        product_id = cursor.lastrowid
+
+        currencies = conn.execute("SELECT id FROM currencies").fetchall()
+        for currency in currencies:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO prices(currency_id, product_id, price)
+                VALUES (?, ?, 'NA')
+                """,
+                (currency["id"], product_id),
+            )
+
+        conn.commit()
+        conn.close()
+        sessions.pop(user_id, None)
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>PRODUCT CREATED</b>\n\n"
+            f"📦 {clean(session['product_name'])}\n"
+            f"🔢 {amount:,} Robux",
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "📦 Products",
+                            callback_data=f"category_products:{category_id}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "⚙️ Admin Panel",
+                            callback_data="admin",
+                        )
+                    ],
+                ]
+            ),
+        )
+        return
+
+    if action == "rename_product":
+        conn = db()
+        conn.execute(
+            "UPDATE products SET name = ? WHERE id = ?",
+            (text, session["product_id"]),
+        )
+        conn.commit()
+        conn.close()
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>PRODUCT NAME UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "📦 Products",
+                        callback_data="admin_products",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "product_button":
+        conn = db()
+        conn.execute(
+            "UPDATE products SET button_text = ? WHERE id = ?",
+            (text, session["product_id"]),
+        )
+        conn.commit()
+        conn.close()
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>PRODUCT BUTTON UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "📦 Products",
+                        callback_data="admin_products",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "change_product_amount":
+        cleaned = text.replace(",", "").replace(" ", "")
+        if not cleaned.isdigit() or int(cleaned) <= 0:
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                "⚠️ Enter a positive whole number.",
+            )
+            return
+
+        amount = int(cleaned)
+        conn = db()
+        conn.execute(
+            "UPDATE products SET amount = ? WHERE id = ?",
+            (amount, session["product_id"]),
+        )
+        conn.commit()
+        conn.close()
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            f"✅ <b>AMOUNT UPDATED</b>\n\n"
+            f"New amount: <b>{amount:,} Robux</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "📦 Products",
+                        callback_data="admin_products",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "product_desc":
+        description = "" if text == "-" else text
+        conn = db()
+        conn.execute(
+            "UPDATE products SET description = ? WHERE id = ?",
+            (description, session["product_id"]),
+        )
+        conn.commit()
+        conn.close()
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>PRODUCT DESCRIPTION UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "📦 Products",
+                        callback_data="admin_products",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "add_currency_name":
+        name = text.strip()
+        if not name:
+            return
+
+        try:
+            conn = db()
+            max_order = conn.execute(
+                "SELECT COALESCE(MAX(sort_order), 0) AS n FROM currencies"
+            ).fetchone()["n"]
+
+            cursor = conn.execute(
+                """
+                INSERT INTO currencies
+                (name, button_text, enabled, sort_order)
+                VALUES (?, ?, 1, ?)
+                """,
+                (name, name, max_order + 1),
+            )
+            currency_id = cursor.lastrowid
+
+            products = conn.execute(
+                "SELECT id FROM products"
+            ).fetchall()
+
+            for product in products:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO prices(currency_id, product_id, price)
+                    VALUES (?, ?, 'NA')
+                    """,
+                    (currency_id, product["id"]),
+                )
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO custom_prices(currency_id, price)
+                VALUES (?, 'NA')
+                """,
+                (currency_id,),
+            )
+
+            conn.commit()
+            conn.close()
+        except sqlite3.IntegrityError:
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                "⚠️ That payment method already exists.",
+            )
+            return
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>PAYMENT METHOD CREATED</b>\n\n"
+            f"💱 {clean(name)}",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "💱 Payment Methods",
+                        callback_data="admin_currencies",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "rename_currency":
+        currency_id = session["currency_id"]
+        try:
+            conn = db()
+            conn.execute(
+                "UPDATE currencies SET name = ? WHERE id = ?",
+                (text, currency_id),
+            )
+            conn.commit()
+            conn.close()
+        except sqlite3.IntegrityError:
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                "⚠️ Another payment method already uses that name.",
+            )
+            return
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>PAYMENT METHOD UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "💱 Payment Methods",
+                        callback_data="admin_currencies",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "currency_button":
+        conn = db()
+        conn.execute(
+            "UPDATE currencies SET button_text = ? WHERE id = ?",
+            (text, session["currency_id"]),
+        )
+        conn.commit()
+        conn.close()
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>PAYMENT BUTTON UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "💱 Payment Methods",
+                        callback_data="admin_currencies",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "set_price":
+        price = text.strip() or "NA"
+        set_price(
+            session["currency_id"],
+            session["product_id"],
+            price,
+        )
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            f"✅ <b>PRICE UPDATED</b>\n\n"
+            f"New price: <b>{clean(price)}</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "💰 Prices",
+                        callback_data="admin_prices",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "set_custom_price":
+        price = text.strip() or "NA"
+        set_custom_price(
+            session["currency_id"],
+            price,
+        )
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            f"✅ <b>CUSTOM PRICE UPDATED</b>\n\n"
+            f"New price: <b>{clean(price)}</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "💰 Prices",
+                        callback_data="admin_prices",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "edit_text":
+        set_text(session["key"], text)
+        key = session["key"]
+        sessions.pop(user_id, None)
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            f"✅ <b>TEXT UPDATED</b>\n\n"
+            f"Section: <b>{clean(TEXT_NAMES.get(key, key))}</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "📝 Texts / Steps",
+                        callback_data="admin_texts",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "edit_button":
+        set_button(session["key"], text)
+        key = session["key"]
+        sessions.pop(user_id, None)
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            f"✅ <b>BUTTON UPDATED</b>\n\n"
+            f"Button: <b>{clean(BUTTON_NAMES.get(key, key))}</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "🔘 Buttons",
+                        callback_data="admin_buttons",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "change_shop_name":
+        set_setting("shop_name", text)
+        sessions.pop(user_id, None)
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>SHOP NAME UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "🏪 Settings",
+                        callback_data="admin_settings",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "change_admin_username":
+        username = text if text.startswith("@") else "@" + text
+        set_setting("admin_username", username)
+        sessions.pop(user_id, None)
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>SUPPORT USERNAME UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "🏪 Settings",
+                        callback_data="admin_settings",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "change_recipient":
+        cleaned = text.strip()
+        if not cleaned.lstrip("-").isdigit():
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                "⚠️ Chat ID must be numeric.",
+            )
+            return
+
+        set_setting("order_recipient_chat_id", cleaned)
+        sessions.pop(user_id, None)
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>ORDER RECIPIENT UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "🏪 Settings",
+                        callback_data="admin_settings",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "change_max_amount":
+        cleaned = text.replace(",", "").replace(" ", "")
+        if not cleaned.isdigit() or int(cleaned) <= 0:
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                "⚠️ Please enter a positive whole number.",
+            )
+            return
+
+        set_setting("max_custom_amount", str(int(cleaned)))
+        sessions.pop(user_id, None)
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>CUSTOM AMOUNT LIMIT UPDATED</b>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "🏪 Settings",
+                        callback_data="admin_settings",
+                    )
+                ]]
+            ),
+        )
+        return
+
+    if action == "add_admin_id":
+        cleaned = text.strip()
+        if not cleaned.isdigit():
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                "⚠️ Telegram ID must contain numbers only.",
+            )
+            return
+
+        target_id = int(cleaned)
+        add_admin(target_id)
+
+        sessions.pop(user_id, None)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            "✅ <b>ADMIN ADDED</b>\n\n"
+            f"🆔 <code>{target_id}</code>",
+            InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton(
+                        "👮 Admins",
+                        callback_data="admin_admins",
+                    )
+                ]]
+            ),
+        )
+        return
 
 
 # ============================================================
-# TEXT MESSAGE HANDLER
+# CUSTOMER TEXT INPUT / ORDER CREATION
 # ============================================================
+
+def generate_order_number():
+    # 10 random uppercase base32-ish characters, with no predictable
+    # sequence. Example: SRP-X7KQ9M2P4A
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+    for _ in range(20):
+        token = "".join(secrets.choice(alphabet) for _ in range(10))
+        candidate = f"SRP-{token}"
+
+        if not get_order(candidate):
+            return candidate
+
+    raise RuntimeError("Could not generate a unique order number.")
+
+
+async def create_order(update, context, session, username):
+    user = update.effective_user
+    user_id = user.id
+
+    currency = get_currency(session.get("currency_id"))
+    category = get_category(session.get("category_id"))
+
+    if not currency or not category:
+        return None
+
+    order_number = generate_order_number()
+    created_at = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
+    telegram_username = user.username or ""
+    telegram_name = user.full_name or ""
+
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO orders
+        (
+            order_number,
+            telegram_id,
+            telegram_username,
+            telegram_name,
+            category,
+            currency,
+            product,
+            robux_amount,
+            price,
+            roblox_username,
+            status,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            order_number,
+            user_id,
+            telegram_username,
+            telegram_name,
+            category["name"],
+            currency["name"],
+            session["product"],
+            int(session["amount"]),
+            session["price"],
+            username,
+            "awaiting_confirmation",
+            created_at,
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    recipient = get_setting("order_recipient_chat_id", "").strip()
+
+    if not recipient and BOOTSTRAP_ADMIN_CHAT_ID:
+        recipient = BOOTSTRAP_ADMIN_CHAT_ID
+
+    if recipient:
+        try:
+            admin_text = render_text(
+                "admin_new_order",
+                order_number=order_number,
+                category=category["name"],
+                currency=currency["name"],
+                product=session["product"],
+                amount=int(session["amount"]),
+                price=session["price"],
+                roblox_username=username,
+                created_at=created_at,
+                customer_name=telegram_name,
+                customer_username=(
+                    f"@{telegram_username}"
+                    if telegram_username
+                    else "No username"
+                ),
+                telegram_id=user_id,
+            )
+
+            await context.bot.send_message(
+                chat_id=int(recipient),
+                text=admin_text,
+                parse_mode="HTML",
+            )
+
+            return {
+                "order_number": order_number,
+                "admin_notified": True,
+                "admin_error": "",
+            }
+
+        except (TelegramError, ValueError) as error:
+            logger.error(
+                "Admin notification failed for order %s: %s",
+                order_number,
+                error,
+            )
+            return {
+                "order_number": order_number,
+                "admin_notified": False,
+                "admin_error": str(error),
+            }
+
+    return {
+        "order_number": order_number,
+        "admin_notified": False,
+        "admin_error": "No order recipient chat ID is configured.",
+    }
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message:
+    if not update.message or not update.message.text:
         return
+
     user = update.effective_user
     user_id = user.id
-    upsert_user(user, update.effective_chat.id)
+    text = update.message.text.strip()
+
     session = sessions.get(user_id)
 
-    # /cancel is handled here for sessions, even though it starts with '/'.
-    if message.text and message.text.strip().lower() == "/cancel":
+    # Remove the user's text message when permitted.
+    await clear_user_message(update)
+
+    if text.lower() == "/cancel":
         sessions.pop(user_id, None)
-        await cleanup_user_message(update)
-        await send_or_edit_screen(
-            context.bot, update.effective_chat.id, user_id,
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
             render_text("cancelled"),
-            main_keyboard(user),
+            main_keyboard(),
         )
-        return
-
-    # --------------------------------------------------------
-    # CUSTOM EMOJI SECOND STAGE
-    # --------------------------------------------------------
-    # This must run before generic admin text handling because a Telegram
-    # custom-emoji message is represented by an entity carrying emoji_id.
-    if is_admin(user) and session and session.get("action") == "add_emoji_value":
-        await cleanup_user_message(update)
-        entities = message.entities or []
-        custom_entities = [e for e in entities if e.type == MessageEntity.CUSTOM_EMOJI]
-        if not custom_entities:
-            await send_or_edit_screen(
-                context.bot, update.effective_chat.id, user_id,
-                "⚠️ I couldn't detect a Telegram custom emoji in that message.\n\nSend the custom emoji itself and try again.",
-                cancel_keyboard(),
-            )
-            return
-        entity = custom_entities[0]
-        emoji_id = entity.custom_emoji_id
-        fallback = "✨"
-        if message.text:
-            start = entity.offset
-            end = entity.offset + entity.length
-            try:
-                fallback = message.text[start:end] or "✨"
-            except Exception:
-                fallback = "✨"
-        name = session["emoji_name"]
-        add_emoji(name, emoji_id, fallback)
-        sessions.pop(user_id, None)
-        await send_or_edit_screen(
-            context.bot, update.effective_chat.id, user_id,
-            "✅ <b>CUSTOM EMOJI SAVED</b>\n\n"
-            f"Name: <b>{esc(name)}</b>\n"
-            f"Token: <code>{{{{emoji:{esc(name)}}}}}</code>",
-            kb([[InlineKeyboardButton("✨ Emojis", callback_data="a:emojis")],[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]),
-        )
-        return
-
-    # --------------------------------------------------------
-    # BACKUP IMPORT VIA PASTED STRING
-    # --------------------------------------------------------
-    if is_admin(user) and session and session.get("action") == "backup_import":
-        await cleanup_user_message(update)
-        try:
-            raw_backup = (message.text or "").strip()
-            payload = decode_backup(raw_backup)
-            session["backup_blob"] = raw_backup
-            session["action"] = "backup_confirm"
-            await send_or_edit_screen(context.bot, update.effective_chat.id, user_id,
-                "⚠️ <b>CONFIRM BACKUP RESTORE</b>\n\n" + backup_summary(payload) + "\n\n"
-                "This will replace the current shop data.",
-                kb([[InlineKeyboardButton("✅ Restore Backup", callback_data="backup:confirm")], [InlineKeyboardButton("❌ Cancel", callback_data="backup:cancel")]]))
-        except Exception as error:
-            await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, f"⚠️ <b>INVALID BACKUP</b>\n\n{esc(error)}", cancel_keyboard())
         return
 
     # --------------------------------------------------------
     # ADMIN INPUT
     # --------------------------------------------------------
+
     if is_admin(user) and session and session.get("action"):
-        action = session["action"]
-        raw = message.text or ""
-        value = raw.strip()
-        await cleanup_user_message(update)
-
-        try:
-            # Categories
-            if action == "add_category":
-                parent_id = session.get("parent_id")
-                if not value:
-                    raise ValueError("Name cannot be empty.")
-                conn = db()
-                sort_order = conn.execute(
-                    "SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM categories WHERE parent_id IS ?",
-                    (parent_id,),
-                ).fetchone()["n"]
-                cur = conn.execute(
-                    "INSERT INTO categories(name, button_text, description, enabled, sort_order, parent_id) VALUES (?, ?, '', 1, ?, ?)",
-                    (value, value, sort_order, parent_id),
-                )
-                cid = cur.lastrowid
-                conn.commit(); conn.close()
-                sessions.pop(user_id, None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id,
-                    "✅ <b>CATEGORY CREATED</b>\n\n" f"📂 {esc(value)}", kb([[InlineKeyboardButton("🗂️ Categories", callback_data=f"acats:{parent_id if parent_id is not None else 'root'}")],[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]))
-                return
-
-            if action == "rename_category":
-                cid = session["category_id"]
-                conn = db(); conn.execute("UPDATE categories SET name=? WHERE id=?", (value, cid)); conn.commit(); conn.close()
-                sessions.pop(user_id, None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Category renamed.", kb([[InlineKeyboardButton("📂 Category", callback_data=f"acat:{cid}")]])); return
-
-            if action == "category_button":
-                cid = session["category_id"]
-                conn = db(); conn.execute("UPDATE categories SET button_text=? WHERE id=?", (value, cid)); conn.commit(); conn.close()
-                sessions.pop(user_id, None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Category button updated.", kb([[InlineKeyboardButton("📂 Category", callback_data=f"acat:{cid}")]])); return
-
-            if action == "category_desc":
-                cid = session["category_id"]; desc = "" if value == "-" else value
-                conn = db(); conn.execute("UPDATE categories SET description=? WHERE id=?", (desc, cid)); conn.commit(); conn.close()
-                sessions.pop(user_id, None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Category description updated.", kb([[InlineKeyboardButton("📂 Category", callback_data=f"acat:{cid}")]])); return
-
-            if action == "category_order":
-                n = int(value); cid = session["category_id"]
-                conn = db(); conn.execute("UPDATE categories SET sort_order=? WHERE id=?", (n,cid)); conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Category order updated.", kb([[InlineKeyboardButton("📂 Category", callback_data=f"acat:{cid}")]])); return
-
-            # Products
-            if action == "add_product_name":
-                if not value: raise ValueError("Product name cannot be empty.")
-                session["product_name"] = value
-                session["action"] = "add_product_amount"
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id,
-                    "🔢 <b>PRODUCT AMOUNT</b>\n\nSend a whole number, or <code>custom</code> for an arbitrary amount.", cancel_keyboard())
-                return
-
-            if action == "add_product_amount":
-                custom = value.lower() == "custom"
-                if custom:
-                    amount = 0
-                else:
-                    cleaned = value.replace(",", "").replace(" ", "")
-                    if not cleaned.isdigit() or int(cleaned) <= 0:
-                        raise ValueError("Use a positive whole number or custom.")
-                    amount = int(cleaned)
-                cid = session["category_id"]
-                conn = db()
-                sort_order = conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM products WHERE category_id=?", (cid,)).fetchone()["n"]
-                cur = conn.execute(
-                    "INSERT INTO products(name, button_text, amount, enabled, sort_order, category_id, description, is_custom) VALUES (?, ?, ?, 1, ?, ?, '', ?)",
-                    (session["product_name"], session["product_name"], amount, sort_order, cid, int(custom)),
-                )
-                pid = cur.lastrowid
-                for c in conn.execute("SELECT id FROM currencies").fetchall():
-                    conn.execute("INSERT OR IGNORE INTO prices(currency_id,product_id,price) VALUES (?,?, 'NA')", (c["id"], pid))
-                conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id,
-                    "✅ <b>PRODUCT CREATED</b>\n\n" f"📦 {esc(session['product_name'])}\n" f"🔢 {'Custom amount' if custom else f'{amount:,} Robux'}",
-                    kb([[InlineKeyboardButton("📦 Products", callback_data="a:products")],[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]]))
-                return
-
-            if action == "product_name":
-                pid=session["product_id"]; conn=db(); conn.execute("UPDATE products SET name=? WHERE id=?", (value,pid)); conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Product name updated.", kb([[InlineKeyboardButton("📦 Product", callback_data=f"a_product:{pid}")]])); return
-
-            if action == "product_button":
-                pid=session["product_id"]; conn=db(); conn.execute("UPDATE products SET button_text=? WHERE id=?", (value,pid)); conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Product button updated.", kb([[InlineKeyboardButton("📦 Product", callback_data=f"a_product:{pid}")]])); return
-
-            if action == "product_amount":
-                pid=session["product_id"]; is_custom=value.lower()=="custom"
-                if is_custom: amount=0
-                else:
-                    cleaned=value.replace(",","").replace(" ","")
-                    if not cleaned.isdigit() or int(cleaned)<=0: raise ValueError("Use a positive whole number or custom.")
-                    amount=int(cleaned)
-                conn=db(); conn.execute("UPDATE products SET amount=?, is_custom=? WHERE id=?", (amount,int(is_custom),pid)); conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Product amount/type updated.", kb([[InlineKeyboardButton("📦 Product", callback_data=f"a_product:{pid}")]])); return
-
-            if action == "product_desc":
-                pid=session["product_id"]; desc="" if value=="-" else value
-                conn=db(); conn.execute("UPDATE products SET description=? WHERE id=?", (desc,pid)); conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Product description updated.", kb([[InlineKeyboardButton("📦 Product", callback_data=f"a_product:{pid}")]])); return
-
-            if action == "product_order":
-                pid=session["product_id"]; n=int(value)
-                conn=db(); conn.execute("UPDATE products SET sort_order=? WHERE id=?", (n,pid)); conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Product order updated.", kb([[InlineKeyboardButton("📦 Product", callback_data=f"a_product:{pid}")]])); return
-
-            # Currencies
-            if action == "add_currency":
-                conn=db(); sort_order=conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM currencies").fetchone()["n"]
-                conn.execute("INSERT INTO currencies(name,button_text,enabled,sort_order) VALUES (?,?,1,?)", (value,value,sort_order))
-                cid=conn.execute("SELECT id FROM currencies WHERE name=?",(value,)).fetchone()["id"]
-                for p in conn.execute("SELECT id FROM products").fetchall():
-                    conn.execute("INSERT OR IGNORE INTO prices(currency_id,product_id,price) VALUES (?,?, 'NA')", (cid,p["id"]))
-                conn.execute("INSERT OR IGNORE INTO custom_prices(currency_id,price) VALUES (?, 'NA')", (cid,)); conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ <b>CURRENCY CREATED</b>\n\n" f"💱 {esc(value)}", kb([[InlineKeyboardButton("💱 Currencies", callback_data="a:currencies")],[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]])); return
-
-            if action == "currency_name":
-                cid=session["currency_id"]; conn=db(); conn.execute("UPDATE currencies SET name=? WHERE id=?",(value,cid)); conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Currency name updated.", kb([[InlineKeyboardButton("💱 Currency", callback_data=f"cedit:{cid}")]])); return
-
-            if action == "currency_button":
-                cid=session["currency_id"]; conn=db(); conn.execute("UPDATE currencies SET button_text=? WHERE id=?",(value,cid)); conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Currency button updated.", kb([[InlineKeyboardButton("💱 Currency", callback_data=f"cedit:{cid}")]])); return
-
-            if action == "currency_order":
-                cid=session["currency_id"]; n=int(value); conn=db(); conn.execute("UPDATE currencies SET sort_order=? WHERE id=?",(n,cid)); conn.commit(); conn.close(); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Currency order updated.", kb([[InlineKeyboardButton("💱 Currency", callback_data=f"cedit:{cid}")]])); return
-
-            # Prices
-            if action == "set_price":
-                set_price(session["currency_id"], session["product_id"], value or "NA"); cid=session["currency_id"]
-                sessions.pop(user_id,None); await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Price updated.", kb([[InlineKeyboardButton("💰 Prices", callback_data=f"pricecur:{cid}")]])); return
-
-            if action == "set_custom_price":
-                cid=session["currency_id"]; set_custom_price(cid, value or "NA"); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Custom amount price updated.", kb([[InlineKeyboardButton("💰 Prices", callback_data=f"pricecur:{cid}")]])); return
-
-            # Text/button editors
-            if action == "edit_text":
-                set_text(session["key"], raw); key=session["key"]; sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Text updated.\n\nPreview:\n" + render_text(key), kb([[InlineKeyboardButton("📝 Texts", callback_data="a:texts")],[InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin")]])); return
-
-            if action == "edit_button":
-                set_button(session["key"], value); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Button text updated.", kb([[InlineKeyboardButton("🔘 Buttons", callback_data="a:buttons")]])); return
-
-            # Settings
-            if action.startswith("setting:"):
-                setting = action.split(":",1)[1]
-                if setting == "shop_name": set_setting("shop_name", value)
-                elif setting == "admin_username": set_setting("admin_username", value if value.startswith("@") else "@"+value)
-                elif setting == "recipient":
-                    int(value)  # validation only
-                    set_setting("order_recipient_chat_id", value)
-                elif setting == "max_amount":
-                    n=int(value)
-                    if n<=0: raise ValueError("Maximum must be positive.")
-                    set_setting("max_custom_amount", n)
-                elif setting == "anti_spam_seconds":
-                    n=float(value)
-                    if n < 0.5 or n > 30: raise ValueError("Use a delay between 0.5 and 30 seconds.")
-                    set_setting("anti_spam_seconds", f"{n:g}")
-                else: raise ValueError("Unknown setting.")
-                sessions.pop(user_id,None); await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Setting updated.", settings_keyboard()); return
-
-            # Custom emoji flow: name -> actual emoji message.
-            if action == "add_emoji_name":
-                name=value.lower()
-                if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name): raise ValueError("Use 1-32 letters, numbers, _ or - only.")
-                if get_emoji_by_name(name): raise ValueError("That emoji name already exists.")
-                session["emoji_name"] = name
-                session["action"] = "add_emoji_value"
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id,
-                    "✨ <b>SEND THE CUSTOM EMOJI</b>\n\nNow send the Telegram custom emoji by itself (or in a short message).\n\nI will detect its custom emoji ID automatically.", cancel_keyboard())
-                return
-
-            if action == "emoji_rename":
-                name=value.lower()
-                if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name): raise ValueError("Invalid token name.")
-                existing=get_emoji_by_name(name)
-                if existing and existing["id"] != session["emoji_id"]: raise ValueError("That name is already used.")
-                update_emoji_name(session["emoji_id"], name); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Custom emoji renamed.", kb([[InlineKeyboardButton("✨ Emojis", callback_data="a:emojis")]])); return
-
-            # Admins
-            if action == "add_admin":
-                target=int(value); add_admin(target, "Admin"); sessions.pop(user_id,None)
-                await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, "✅ Admin added.", admins_keyboard()); return
-
-            raise ValueError("Unknown admin action.")
-
-        except sqlite3.IntegrityError as error:
-            logger.warning("Admin input integrity error: %s", error)
-            await send_or_edit_screen(context.bot, update.effective_chat.id, user_id,
-                "⚠️ <b>Could not save that.</b>\n\nIt may already exist or contain a duplicate value.", cancel_keyboard())
-            return
-        except (ValueError, TypeError) as error:
-            await send_or_edit_screen(context.bot, update.effective_chat.id, user_id,
-                f"⚠️ <b>Invalid input</b>\n\n{esc(error)}\n\nPlease try again.", cancel_keyboard())
-            return
+        await handle_admin_input(
+            update,
+            context,
+            session,
+            text,
+        )
+        return
 
     # --------------------------------------------------------
     # CUSTOMER INPUT
     # --------------------------------------------------------
+
     if not session:
-        await cleanup_user_message(update)
-        await send_or_edit_screen(
-            context.bot, update.effective_chat.id, user_id,
-            render_text("no_session"), main_keyboard(user)
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            render_text("no_session"),
+            main_keyboard(),
         )
         return
-
-    text = (message.text or "").strip()
-    await cleanup_user_message(update)
 
     if session.get("waiting") == "custom_amount":
         cleaned = text.replace(",", "").replace(" ", "")
-        try:
-            amount = int(cleaned)
-        except ValueError:
-            amount = 0
-        max_amount = int(get_setting("max_custom_amount", "1000000"))
-        if amount < 1 or amount > max_amount:
-            await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, render_text("invalid_amount"), cancel_keyboard())
-            return
-        session["amount"] = amount
-        session["waiting"] = "username"
-        await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, render_text("username"), cancel_keyboard())
-        return
 
-    if session.get("waiting") == "username":
-        if not valid_roblox_username(text):
-            await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, render_text("invalid_username"), cancel_keyboard())
-            return
-        try:
-            order = create_order(user, session, text.lstrip("@"))
-        except Exception as error:
-            logger.exception("Order creation failed")
-            sessions.pop(user_id, None)
-            await send_or_edit_screen(context.bot, update.effective_chat.id, user_id, render_text("order_error"), main_keyboard(user))
-            return
-
-        admin_chat = get_setting("order_recipient_chat_id", "").strip()
-        if not admin_chat and BOOTSTRAP_ADMIN_CHAT_ID:
-            admin_chat = BOOTSTRAP_ADMIN_CHAT_ID
-        admin_message = render_text(
-            "admin_new_order",
-            order_number=order["order_number"],
-            category=order["category"],
-            currency=order["currency"],
-            product=order["product"],
-            amount=order["robux_amount"],
-            price=order["price"],
-            roblox_username=order["roblox_username"],
-            created_at=order["created_at"],
-            customer_name=order["telegram_name"] or "Unknown",
-            customer_username=("@" + order["telegram_username"]) if order["telegram_username"] else "No username",
-            telegram_id=order["telegram_id"],
-        )
-        notify_error = None
-        if admin_chat:
-            try:
-                await context.bot.send_message(chat_id=int(admin_chat), text=admin_message, parse_mode="HTML")
-            except Exception as error:
-                notify_error = error
-                logger.error("Could not notify admin for %s: %s", order["order_number"], error)
-        else:
-            notify_error = "No order recipient chat ID is configured."
-
-        sessions.pop(user_id, None)
-        if notify_error:
-            # Still confirm the order was stored; don't pretend delivery to the admin succeeded.
-            await send_or_edit_screen(
-                context.bot, update.effective_chat.id, user_id,
-                render_text("admin_send_failed", order_number=order["order_number"], error=str(notify_error)),
-                order_end_keyboard(),
+        if not cleaned.isdigit():
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                render_text(
+                    "invalid_amount",
+                    max_custom_amount=get_setting(
+                        "max_custom_amount",
+                        "1000000",
+                    ),
+                ),
+                cancel_keyboard(),
             )
             return
 
-        await send_or_edit_screen(
-            context.bot, update.effective_chat.id, user_id,
-            render_text("confirmation", order_number=order["order_number"]),
-            order_end_keyboard(),
+        amount = int(cleaned)
+        max_amount = int(
+            get_setting("max_custom_amount", "1000000")
+        )
+
+        if amount <= 0 or amount > max_amount:
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                render_text(
+                    "invalid_amount",
+                    max_custom_amount=max_amount,
+                ),
+                cancel_keyboard(),
+            )
+            return
+
+        session["amount"] = amount
+        session["product"] = "Custom Amount"
+        session["price"] = get_custom_price(
+            session["currency_id"]
+        )
+        session["waiting"] = "username"
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            render_text("username"),
+            cancel_keyboard(),
+        )
+        return
+
+    if session.get("waiting") == "username":
+        username = text.lstrip("@")
+
+        if (
+            len(username) < 3
+            or len(username) > 20
+            or not all(
+                character.isalnum() or character == "_"
+                for character in username
+            )
+        ):
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                render_text("invalid_username"),
+                cancel_keyboard(),
+            )
+            return
+
+        try:
+            order_result = await create_order(
+                update,
+                context,
+                session,
+                username,
+            )
+        except Exception:
+            logger.exception("Failed to create order")
+            order_result = None
+
+        if not order_result:
+            await remember_screen(
+                context.bot,
+                update.effective_chat.id,
+                user_id,
+                render_text("order_error"),
+                main_keyboard(),
+            )
+            return
+
+        sessions.pop(user_id, None)
+
+        # If admin notification failed, the order still exists and is visible
+        # inside the admin Orders panel after the recipient is fixed.
+        if not order_result["admin_notified"]:
+            logger.warning(
+                "Order %s created without a successful admin notification: %s",
+                order_result["order_number"],
+                order_result["admin_error"],
+            )
+
+        await remember_screen(
+            context.bot,
+            update.effective_chat.id,
+            user_id,
+            render_text(
+                "confirmation",
+                order_number=order_result["order_number"],
+            ),
+            InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            get_button("new_order", "💱 New Order"),
+                            callback_data="exchange",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            get_button("home", "🏠 Main Menu"),
+                            callback_data="home",
+                        )
+                    ],
+                ]
+            ),
         )
         return
 
 
 # ============================================================
-# STARTUP VALIDATION / ERROR HANDLER
+# ERROR HANDLER
 # ============================================================
 
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Unhandled exception", exc_info=context.error)
-
-
-def validate_config():
-    if not BOT_TOKEN or BOT_TOKEN == "BOT_TOKEN" or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        raise RuntimeError("BOT_TOKEN is missing or still a placeholder. Set the real token in Railway Variables.")
-    if BOOTSTRAP_ADMIN_CHAT_ID and not BOOTSTRAP_ADMIN_CHAT_ID.lstrip("-").isdigit():
-        logger.warning("ADMIN_CHAT_ID is not numeric; set it to your Telegram numeric ID for reliable admin access and order delivery.")
+async def error_handler(update, context):
+    logger.error(
+        "Unhandled exception:",
+        exc_info=context.error,
+    )
 
 
-def main():
-    validate_config()
-    fresh_db = not os.path.exists(DATABASE_FILE)
+# ============================================================
+# RUN
+# ============================================================
+
+def run():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is missing from Railway Variables."
+        )
+
+    if BOT_TOKEN == "BOT_TOKEN":
+        raise RuntimeError(
+            "BOT_TOKEN is still set to the placeholder 'BOT_TOKEN'."
+        )
+
     init_db()
-    load_embedded_backup_if_fresh(fresh_db)
-    logger.setLevel(logging.DEBUG if get_setting("debug_mode", "0") == "1" else logging.INFO)
-    logger.info("Database: %s", DATABASE_FILE)
-    logger.info("SRPExchange v4 starting...")
+    logger.info("Database initialized.")
 
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("admin", admin_command))
-    application.add_handler(CommandHandler("cancel", text_handler))
-    application.add_handler(CallbackQueryHandler(callback_handler))
-    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    application = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("admin", admin)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(callback_handler)
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_handler,
+        )
+    )
+
     application.add_error_handler(error_handler)
-    application.run_polling(drop_pending_updates=True)
+
+    logger.info("SRPExchange bot starting...")
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
-    main()
+    run()
