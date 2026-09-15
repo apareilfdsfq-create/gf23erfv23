@@ -85,12 +85,10 @@ def init_db():
             button_text TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
             enabled INTEGER NOT NULL DEFAULT 1,
-            visibility INTEGER NOT NULL DEFAULT 1,
             sort_order INTEGER NOT NULL DEFAULT 0
         )
         """
     )
-    ensure_column(conn, "categories", "visibility", "INTEGER NOT NULL DEFAULT 1")
 
     # Exchange currencies / payment methods.
     cur.execute(
@@ -114,14 +112,12 @@ def init_db():
             button_text TEXT NOT NULL,
             amount INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
-            visibility INTEGER NOT NULL DEFAULT 1,
             sort_order INTEGER NOT NULL DEFAULT 0
         )
         """
     )
     ensure_column(conn, "products", "category_id", "INTEGER")
     ensure_column(conn, "products", "description", "TEXT NOT NULL DEFAULT ''")
-    ensure_column(conn, "products", "visibility", "INTEGER NOT NULL DEFAULT 1")
 
     # Price matrix: currency x product.
     cur.execute(
@@ -560,7 +556,6 @@ def get_categories(enabled_only=False):
         """
         SELECT * FROM categories
         WHERE enabled = 1
-          AND visibility = 1
         ORDER BY sort_order, id
         """
         if enabled_only
@@ -627,7 +622,6 @@ def get_products(category_id=None, enabled_only=False):
 
     if enabled_only:
         conditions.append("enabled = 1")
-        conditions.append("visibility = 1")
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -1255,13 +1249,9 @@ async def show_categories(query):
 async def show_currency_step(query, category_id):
     category = get_category(category_id)
 
-    if (
-        not category
-        or not category["enabled"]
-        or not category["visibility"]
-    ):
+    if not category or not category["enabled"]:
         await query.answer(
-            "This category is not currently public.",
+            "This category is unavailable.",
             show_alert=True,
         )
         return
@@ -1371,11 +1361,10 @@ async def show_admin_categories(query):
     if categories:
         for category in categories:
             status = "🟢" if category["enabled"] else "🔴"
-            visibility = "🌐" if category["visibility"] else "🔒"
             rows.append(
                 [
                     InlineKeyboardButton(
-                        f"{status} {visibility} {category['button_text']}",
+                        f"{status} {category['button_text']}",
                         callback_data=f"edit_category:{category['id']}",
                     )
                 ]
@@ -1391,9 +1380,7 @@ async def show_admin_categories(query):
         query,
         query.from_user.id,
         "🗂️ <b>CATEGORIES</b>\n\n"
-        "Create unlimited categories and put products inside them.\n\n"
-        "🌐 Public = customers can see it\n"
-        "🔒 Private = admins only",
+        "Create unlimited categories and put products inside them.",
         InlineKeyboardMarkup(rows),
     )
 
@@ -1431,12 +1418,6 @@ def category_admin_keyboard(category_id):
             ],
             [
                 InlineKeyboardButton(
-                    "🌐 / 🔒 Public / Private",
-                    callback_data=f"toggle_category_visibility:{category_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
                     "⬆️ Up",
                     callback_data=f"category_up:{category_id}",
                 ),
@@ -1469,7 +1450,6 @@ async def show_edit_category(query, category_id):
 
     products = get_products(category_id, False)
     status = "🟢 Enabled" if category["enabled"] else "🔴 Disabled"
-    visibility = "🌐 Public" if category["visibility"] else "🔒 Private"
 
     await edit_screen(
         query,
@@ -1478,8 +1458,7 @@ async def show_edit_category(query, category_id):
         f"🏷️ Name: <b>{clean(category['name'])}</b>\n"
         f"🔘 Button: <b>{clean(category['button_text'])}</b>\n"
         f"📦 Products: <b>{len(products)}</b>\n"
-        f"📌 Status: <b>{status}</b>\n"
-        f"👁️ Visibility: <b>{visibility}</b>",
+        f"📌 Status: <b>{status}</b>",
         category_admin_keyboard(category_id),
     )
 
@@ -1502,11 +1481,10 @@ async def category_product_list(query, category_id):
     products = get_products(category_id, False)
     for product in products:
         status = "🟢" if product["enabled"] else "🔴"
-        visibility = "🌐" if product["visibility"] else "🔒"
         rows.append(
             [
                 InlineKeyboardButton(
-                    f"{status} {visibility} {product['button_text']}",
+                    f"{status} {product['button_text']}",
                     callback_data=f"edit_product:{product['id']}",
                 )
             ]
@@ -1554,9 +1532,7 @@ async def show_admin_products(query):
         query,
         query.from_user.id,
         "📦 <b>PRODUCTS</b>\n\n"
-        "Choose a category to add, edit, disable or remove products.\n\n"
-        "🌐 Public = customers can see it\n"
-        "🔒 Private = admins only",
+        "Choose a category to add, edit, disable or remove products.",
         InlineKeyboardMarkup(rows),
     )
 
@@ -1607,12 +1583,6 @@ def product_admin_keyboard(product_id):
             ],
             [
                 InlineKeyboardButton(
-                    "🌐 / 🔒 Public / Private",
-                    callback_data=f"toggle_product_visibility:{product_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
                     "⬆️ Up",
                     callback_data=f"product_up:{product_id}",
                 ),
@@ -1649,7 +1619,6 @@ async def show_edit_product(query, product_id):
 
     category = get_category(product["category_id"]) if product["category_id"] else None
     status = "🟢 Enabled" if product["enabled"] else "🔴 Disabled"
-    visibility = "🌐 Public" if product["visibility"] else "🔒 Private"
 
     await edit_screen(
         query,
@@ -1659,8 +1628,7 @@ async def show_edit_product(query, product_id):
         f"🔘 Button: <b>{clean(product['button_text'])}</b>\n"
         f"🔢 Amount: <b>{product['amount']:,} Robux</b>\n"
         f"🗂️ Category: <b>{clean(category['name']) if category else 'None'}</b>\n"
-        f"📌 Status: <b>{status}</b>\n"
-        f"👁️ Visibility: <b>{visibility}</b>",
+        f"📌 Status: <b>{status}</b>",
         product_admin_keyboard(product_id),
     )
 
@@ -2171,17 +2139,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("category:"):
         category_id = int(data.split(":", 1)[1])
-        category = get_category(category_id)
-        if (
-            not category
-            or not category["enabled"]
-            or not category["visibility"]
-        ):
-            await query.answer(
-                "This category is not currently public.",
-                show_alert=True,
-            )
-            return
         await show_currency_step(query, category_id)
         return
 
@@ -2205,7 +2162,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (
             not product
             or not product["enabled"]
-            or not product["visibility"]
             or product["category_id"] != session.get("category_id")
         ):
             await query.answer(
@@ -2331,22 +2287,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Send <code>-</code> for no description.",
             category_id=int(data.split(":", 1)[1]),
         )
-        return
-
-    if data.startswith("toggle_category_visibility:"):
-        category_id = int(data.split(":", 1)[1])
-        conn = db()
-        conn.execute(
-            """
-            UPDATE categories
-            SET visibility = CASE WHEN visibility = 1 THEN 0 ELSE 1 END
-            WHERE id = ?
-            """,
-            (category_id,),
-        )
-        conn.commit()
-        conn.close()
-        await show_edit_category(query, category_id)
         return
 
     if data.startswith("toggle_category:"):
@@ -2538,22 +2478,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
 
-        await show_edit_product(query, product_id)
-        return
-
-    if data.startswith("toggle_product_visibility:"):
-        product_id = int(data.split(":", 1)[1])
-        conn = db()
-        conn.execute(
-            """
-            UPDATE products
-            SET visibility = CASE WHEN visibility = 1 THEN 0 ELSE 1 END
-            WHERE id = ?
-            """,
-            (product_id,),
-        )
-        conn.commit()
-        conn.close()
         await show_edit_product(query, product_id)
         return
 
